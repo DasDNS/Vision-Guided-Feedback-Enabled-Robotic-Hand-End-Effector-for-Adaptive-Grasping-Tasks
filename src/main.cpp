@@ -43,23 +43,6 @@ INA226_WE ina226_4(INA226_ADDRESS);
 int currentPulseWidth = 1450;
 unsigned long lastPeriodicPrint = 0;
 
-// [ADDED] Servo attach-on-demand flag + helper
-bool servosEnabled = false;
-
-void attachServosOnce() {
-  if (servosEnabled) return;
-
-  servo0.attach(SERVO0_PIN);
-  servo1.attach(SERVO1_PIN);
-  servo2.attach(SERVO2_PIN);
-  servo3.attach(SERVO3_PIN);
-  servo4.attach(SERVO4_PIN);
-
-  servosEnabled = true;
-
-  Serial.println("Servos attached (enabled).");
-}
-
 // ===============================
 // PCA9548A CHANNEL SELECT
 // ===============================
@@ -142,9 +125,6 @@ void printINA226Data() {
 // MOVE ALL SERVOS (unchanged behavior)
 // ===============================
 void moveServoUS(int pulseWidth) {
-  // [ADDED] Attach servos only when a command is issued
-  attachServosOnce();
-
   if (pulseWidth < SERVO_MIN_US) pulseWidth = SERVO_MIN_US;
   if (pulseWidth > SERVO_MAX_US) pulseWidth = SERVO_MAX_US;
 
@@ -305,14 +285,13 @@ void setup() {
   selectPCAChannel(4); ina226_4.waitUntilConversionCompleted();
 
   // -------- SERVO SETUP --------
-  // [REMOVED] Do NOT attach servos at boot (prevents jump to middle)
-  // servo0.attach(SERVO0_PIN);
-  // servo1.attach(SERVO1_PIN);
-  // servo2.attach(SERVO2_PIN);
-  // servo3.attach(SERVO3_PIN);
-  // servo4.attach(SERVO4_PIN);
+  servo0.attach(SERVO0_PIN);
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  servo3.attach(SERVO3_PIN);
+  servo4.attach(SERVO4_PIN);
 
-  Serial.println("Servos DISABLED at boot (not attached). They will attach/move only after you send a command.");
+  Serial.println("Servos attached:");
   Serial.println("S0 PB13 (Pinky), S1 PB14 (Ring), S2 PB15 (Middle), S3 PA8 (Index), S4 PA11 (Thumb)");
 
   // -------- FSR SETUP --------
@@ -338,11 +317,6 @@ void loop() {
   // ---- Serial commands (UNCHANGED) ----
   if (Serial.available()) {
     char cmd = Serial.read();
-
-    if (cmd != '\n' && cmd != '\r') {
-      Serial.print("Received: ");
-      Serial.println(cmd);
-    }
 
     switch (cmd) {
       case '0': moveServoUS(SERVO_MIN_US); break;
