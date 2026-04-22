@@ -23,7 +23,7 @@
 
 #define SERVO_MIN_US 500
 #define SERVO_MAX_US 2400
-#define SERVO_STEP   300
+#define SERVO_STEP   200
 
 // ===============================
 // OBJECTS
@@ -40,8 +40,45 @@ INA226_WE ina226_4(INA226_ADDRESS);
 // ===============================
 // GLOBAL VARIABLES
 // ===============================
-int currentPulseWidth = 1450;
+
+// [CHANGED] Start from position '2' (fully straight)
+int currentPulseWidth = SERVO_MAX_US;
+
 unsigned long lastPeriodicPrint = 0;
+
+// Servo attach-on-demand flag + helper
+bool servosEnabled = false;
+
+// Pulse sync flag
+bool pulseSynced = false;
+
+void attachServosOnce() {
+  if (servosEnabled) return;
+
+  servo0.attach(SERVO0_PIN);
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  servo3.attach(SERVO3_PIN);
+  servo4.attach(SERVO4_PIN);
+
+  servosEnabled = true;
+
+  // Do NOT writeMicroseconds() here (prevents commanded movement on attach)
+  Serial.println("Servos attached (no movement). Waiting for command...");
+}
+
+// Sync currentPulseWidth once AFTER attach
+void syncPulseWidthFromServo() {
+  if (pulseSynced) return;
+
+  // [CHANGED] We want the software baseline to start from command '2'
+  // (fully straight), not from the library default (~1500).
+  pulseSynced = true;
+
+  Serial.print("Pulse baseline set to (start at '2'): ");
+  Serial.print(currentPulseWidth);
+  Serial.println(" us");
+}
 
 // ===============================
 // PCA9548A CHANNEL SELECT
@@ -122,9 +159,12 @@ void printINA226Data() {
 }
 
 // ===============================
-// MOVE ALL SERVOS (unchanged behavior)
+// MOVE ALL SERVOS
 // ===============================
 void moveServoUS(int pulseWidth) {
+  attachServosOnce();
+  syncPulseWidthFromServo();
+
   if (pulseWidth < SERVO_MIN_US) pulseWidth = SERVO_MIN_US;
   if (pulseWidth > SERVO_MAX_US) pulseWidth = SERVO_MAX_US;
 
@@ -141,7 +181,7 @@ void moveServoUS(int pulseWidth) {
 
   unsigned long start = millis();
   while (millis() - start < 1000) {
-    printINA226Data(); // unchanged (includes delay(300))
+    printINA226Data();
   }
 }
 
@@ -285,13 +325,7 @@ void setup() {
   selectPCAChannel(4); ina226_4.waitUntilConversionCompleted();
 
   // -------- SERVO SETUP --------
-  servo0.attach(SERVO0_PIN);
-  servo1.attach(SERVO1_PIN);
-  servo2.attach(SERVO2_PIN);
-  servo3.attach(SERVO3_PIN);
-  servo4.attach(SERVO4_PIN);
-
-  Serial.println("Servos attached:");
+  Serial.println("Servos DISABLED at boot (not attached). They will attach/move only after you send a command.");
   Serial.println("S0 PB13 (Pinky), S1 PB14 (Ring), S2 PB15 (Middle), S3 PA8 (Index), S4 PA11 (Thumb)");
 
   // -------- FSR SETUP --------
@@ -314,9 +348,13 @@ void setup() {
 // =========================== LOOP ======================
 // ======================================================
 void loop() {
-  // ---- Serial commands (UNCHANGED) ----
   if (Serial.available()) {
     char cmd = Serial.read();
+
+    if (cmd != '\n' && cmd != '\r') {
+      Serial.print("Received: ");
+      Serial.println(cmd);
+    }
 
     switch (cmd) {
       case '0': moveServoUS(SERVO_MIN_US); break;
@@ -342,7 +380,6 @@ void loop() {
   }
 
   // ---- Periodic FSR update (added) ----
-  // Note: updateFSRSystem() itself takes time (samples*delay_ms), same as your original code.
   if (millis() - lastFSRRun >= FSR_PERIOD_MS) {
     lastFSRRun = millis();
     updateFSRSystem();
