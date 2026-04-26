@@ -21,9 +21,18 @@
 #define SERVO3_PIN PA8   // Index  (INA channel 3)
 #define SERVO4_PIN PA11  // Thumb  (INA channel 4)
 
-#define SERVO_MIN_US 500
+#define SERVO_MIN_US 1200
 #define SERVO_MAX_US 2400
-#define SERVO_STEP   200
+#define SERVO_STEP   300
+
+// Sweep delay between steps (your value)
+#define SWEEP_DELAY_MS 3000
+
+// Choose current print frequency (5 times per 1 second)
+#define CURRENT_PRINT_PERIOD_MS 200
+
+// Choose FSR print frequency (5 times per 1 second)
+#define FSR_PRINT_PERIOD_MS 200
 
 // ===============================
 // OBJECTS
@@ -41,17 +50,26 @@ INA226_WE ina226_4(INA226_ADDRESS);
 // GLOBAL VARIABLES
 // ===============================
 
-// [CHANGED] Start from position '2' (fully straight)
+// No initial servo movement: this is just a software variable
 int currentPulseWidth = SERVO_MAX_US;
 
-unsigned long lastPeriodicPrint = 0;
+unsigned long lastCurrentPrint = 0;
+unsigned long lastFSRPrint = 0;
 
 // Servo attach-on-demand flag + helper
 bool servosEnabled = false;
 
-// Pulse sync flag
-bool pulseSynced = false;
+// ===============================
+// [NEW] SWEEP STATE MACHINE
+// ===============================
+bool sweepActive = false;
+int  sweepTargetEnd = SERVO_MAX_US;
+int  sweepStep = SERVO_STEP;              // signed step while sweeping
+unsigned long nextSweepStepAt = 0;        // millis() when next sweep step should happen
 
+// ===============================
+// SERVO ATTACH (no movement on boot)
+// ===============================
 void attachServosOnce() {
   if (servosEnabled) return;
 
@@ -63,21 +81,7 @@ void attachServosOnce() {
 
   servosEnabled = true;
 
-  // Do NOT writeMicroseconds() here (prevents commanded movement on attach)
-  Serial.println("Servos attached (no movement). Waiting for command...");
-}
-
-// Sync currentPulseWidth once AFTER attach
-void syncPulseWidthFromServo() {
-  if (pulseSynced) return;
-
-  // [CHANGED] We want the software baseline to start from command '2'
-  // (fully straight), not from the library default (~1500).
-  pulseSynced = true;
-
-  Serial.print("Pulse baseline set to (start at '2'): ");
-  Serial.print(currentPulseWidth);
-  Serial.println(" us");
+  Serial.println("Servos attached (enabled).");
 }
 
 // ===============================
@@ -111,6 +115,8 @@ void checkForI2cErrors(INA226_WE &sensor) {
 
 // ===============================
 // PRINT ALL CURRENTS (channels 0..4)
+// Format MUST stay:
+// millis,pulse,S0=.. mA, S1=.. mA, S2=.. mA, S3=.. mA, S4=.. mA
 // ===============================
 void printINA226Data() {
   float c0, c1, c2, c3, c4;
@@ -154,17 +160,12 @@ void printINA226Data() {
   Serial.print("S4=");
   Serial.print(c4);
   Serial.println(" mA");
-
-  delay(300); // keep exactly like your original
 }
 
 // ===============================
-// MOVE ALL SERVOS
+// MOVE ALL SERVOS (single target)
 // ===============================
-void moveServoUS(int pulseWidth) {
-  attachServosOnce();
-  syncPulseWidthFromServo();
-
+void applyServoPulseUS(int pulseWidth) {
   if (pulseWidth < SERVO_MIN_US) pulseWidth = SERVO_MIN_US;
   if (pulseWidth > SERVO_MAX_US) pulseWidth = SERVO_MAX_US;
 
@@ -178,11 +179,59 @@ void moveServoUS(int pulseWidth) {
   servo2.writeMicroseconds(currentPulseWidth);
   servo3.writeMicroseconds(currentPulseWidth);
   servo4.writeMicroseconds(currentPulseWidth);
+}
 
-  unsigned long start = millis();
-  while (millis() - start < 1000) {
-    printINA226Data();
+void moveServoUS(int pulseWidth) {
+  attachServosOnce();
+  sweepActive = false; // stop any sweep
+  applyServoPulseUS(pulseWidth);
+}
+
+// ===============================
+// [NEW] START SWEEP (non-blocking)
+// ===============================
+void startSweep(int startUs, int endUs, int stepUs) {
+  attachServosOnce();
+
+  if (startUs < SERVO_MIN_US) startUs = SERVO_MIN_US;
+  if (startUs > SERVO_MAX_US) startUs = SERVO_MAX_US;
+  if (endUs < SERVO_MIN_US) endUs = SERVO_MIN_US;
+  if (endUs > SERVO_MAX_US) endUs = SERVO_MAX_US;
+
+  // Set the starting position immediately
+  applyServoPulseUS(startUs);
+
+  sweepTargetEnd = endUs;
+
+  int dir = (endUs >= startUs) ? 1 : -1;
+  sweepStep = abs(stepUs) * dir;
+
+  sweepActive = true;
+  nextSweepStepAt = millis() + SWEEP_DELAY_MS; // first increment after delay
+}
+
+// ===============================
+// [NEW] UPDATE SWEEP (call from loop)
+// ===============================
+void updateSweep() {
+  if (!sweepActive) return;
+
+  unsigned long now = millis();
+  if (now < nextSweepStepAt) return;
+
+  int nextPw = currentPulseWidth + sweepStep;
+
+  // Check if we reached/passed end
+  if ((sweepStep > 0 && nextPw >= sweepTargetEnd) ||
+      (sweepStep < 0 && nextPw <= sweepTargetEnd)) {
+
+    applyServoPulseUS(sweepTargetEnd);
+    sweepActive = false;   // done
+    return;
   }
+
+  applyServoPulseUS(nextPw);
+  nextSweepStepAt = now + SWEEP_DELAY_MS;
 }
 
 // ======================================================
@@ -195,91 +244,22 @@ uint8_t fsrPins[NUM_SENSORS] = {
   PB0, PA7, PA6, PA5, PA4, PA3, PA2, PA1, PA0
 };
 
+// Pin names for printing
 const char* fsrPinNames[NUM_SENSORS] = {
   "PB0", "PA7", "PA6", "PA5", "PA4", "PA3", "PA2", "PA1", "PA0"
 };
 
-const int samples = 80;
-const int delay_ms = 3;
-const float threshold = 15.0;
-const int stableCyclesNeeded = 5;
-
-float prevMean[NUM_SENSORS]  = {0};
-float savedData[NUM_SENSORS] = {0};
-
-int stableCounter = 0;
-bool hasSaved = false;
-
-// Non-blocking scheduler for FSR loop prints
-unsigned long lastFSRRun = 0;
-const unsigned long FSR_PERIOD_MS = 200;
-
-// Run one full FSR update (same algorithm as your code)
-void updateFSRSystem() {
-  float meanVal[NUM_SENSORS] = {0};
-
-  // ---- Take samples ----
-  for (int i = 0; i < samples; i++) {
-    for (int s = 0; s < NUM_SENSORS; s++) {
-      meanVal[s] += analogRead(fsrPins[s]);
-    }
-    delay(delay_ms);
-  }
-
-  // ---- Compute mean ----
-  for (int s = 0; s < NUM_SENSORS; s++) {
-    meanVal[s] /= samples;
-  }
-
-  // ---- Stability detection ----
-  bool allStable = true;
-  for (int s = 0; s < NUM_SENSORS; s++) {
-    float delta = fabs(meanVal[s] - prevMean[s]);
-    if (delta > threshold) {
-      allStable = false;
-    }
-  }
-
-  if (allStable) {
-    stableCounter++;
-  } else {
-    stableCounter = 0;
-    hasSaved = false;
-  }
-
-  // ---- AUTO SAVE ----
-  if (stableCounter >= stableCyclesNeeded && !hasSaved) {
-    Serial.println("=====================================");
-    Serial.println("STABLE → DATA SAVED");
-    Serial.print("FSR Snapshot: ");
-
-    for (int s = 0; s < NUM_SENSORS; s++) {
-      savedData[s] = meanVal[s];
-      Serial.print(fsrPinNames[s]);
-      Serial.print("=");
-      Serial.print(savedData[s], 2);
-      if (s < NUM_SENSORS - 1) Serial.print(", ");
-    }
-
-    Serial.println();
-    Serial.println("=====================================");
-    hasSaved = true;
-  }
-
-  // ---- Print live readings ----
+// Print-only FSR readings (no stability, no saving)
+void printFSRLive() {
   Serial.print("FSR Live: ");
   for (int s = 0; s < NUM_SENSORS; s++) {
+    float v = analogRead(fsrPins[s]);
     Serial.print(fsrPinNames[s]);
     Serial.print("=");
-    Serial.print(meanVal[s], 2);
+    Serial.print(v, 2);
     if (s < NUM_SENSORS - 1) Serial.print(", ");
   }
   Serial.println();
-
-  // ---- Update last mean ----
-  for (int s = 0; s < NUM_SENSORS; s++) {
-    prevMean[s] = meanVal[s];
-  }
 }
 
 // ======================================================
@@ -289,7 +269,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  Serial.println("\n=== STM32 Black Pill: 5 Servo + 5 INA226 (PCA ch0..4) + 9 FSR Auto-Save ===");
+  Serial.println("\n=== STM32 Black Pill: 5 Servo + 5 INA226 (PCA ch0..4) + 9 FSR Live ===");
 
   // -------- I2C SETUP --------
   Wire.setSDA(PB9);
@@ -332,12 +312,11 @@ void setup() {
   for (int i = 0; i < NUM_SENSORS; i++) {
     pinMode(fsrPins[i], INPUT_ANALOG);
   }
-  Serial.println("FSR Auto-Save System Ready...");
 
   Serial.println("\n📟 Serial Commands Reference");
-  Serial.println("0 → Fully bent");
-  Serial.println("1 → Mid position");
-  Serial.println("2 → Fully straight");
+  Serial.println("0 → Fully bent (sweep from 2400 to 500)");
+  Serial.println("1 → Fully straight (sweep from 500 to 2400)");
+  Serial.println("2 → Fully straight (instant)");
   Serial.println("3 → Step −300 µs");
   Serial.println("4 → Step +300 µs");
   Serial.println("------------------------------");
@@ -348,6 +327,7 @@ void setup() {
 // =========================== LOOP ======================
 // ======================================================
 void loop() {
+  // ---- Serial commands ----
   if (Serial.available()) {
     char cmd = Serial.read();
 
@@ -357,14 +337,32 @@ void loop() {
     }
 
     switch (cmd) {
-      case '0': moveServoUS(SERVO_MIN_US); break;
-      case '1': moveServoUS(1450); break;
-      case '2': moveServoUS(SERVO_MAX_US); break;
-      case '3': moveServoUS(currentPulseWidth - SERVO_STEP); break;
-      case '4': moveServoUS(currentPulseWidth + SERVO_STEP); break;
+      case '0':
+        // Start non-blocking sweep: spread -> bend
+        startSweep(SERVO_MAX_US, SERVO_MIN_US, SERVO_STEP);
+        break;
+
+      case '1':
+        // Start non-blocking sweep: bend -> spread
+        startSweep(SERVO_MIN_US, SERVO_MAX_US, SERVO_STEP);
+        break;
+
+      case '2':
+        moveServoUS(SERVO_MAX_US);
+        break;
+
+      case '3':
+        moveServoUS(currentPulseWidth - SERVO_STEP);
+        break;
+
+      case '4':
+        moveServoUS(currentPulseWidth + SERVO_STEP);
+        break;
+
       case '\n':
       case '\r':
         break;
+
       default:
         Serial.println("Invalid command. Use 0–4.");
         break;
@@ -373,15 +371,19 @@ void loop() {
     Serial.println("Enter next command:");
   }
 
-  // ---- Periodic INA print (UNCHANGED) ----
-  if (millis() - lastPeriodicPrint >= 1000) {
-    lastPeriodicPrint = millis();
+  // ---- Update sweep state machine (non-blocking) ----
+  updateSweep();
+
+  // ---- Periodic current print (always, fixed format for your Python parser) ----
+  if (millis() - lastCurrentPrint >= CURRENT_PRINT_PERIOD_MS) {
+    lastCurrentPrint = millis();
     printINA226Data();
   }
 
-  // ---- Periodic FSR update (added) ----
-  if (millis() - lastFSRRun >= FSR_PERIOD_MS) {
-    lastFSRRun = millis();
-    updateFSRSystem();
+  // ---- Periodic FSR live print (always, same "FSR Live:" format) ----
+  if (millis() - lastFSRPrint >= FSR_PRINT_PERIOD_MS) {
+    lastFSRPrint = millis();
+    printFSRLive();
   }
 }
+
