@@ -1,164 +1,229 @@
-# STM32 Robotic Hand — Servos + INA226 Current + FSR Live (PCA9548A)
+# STM32 Blackpill Robotic Hand Logger
+### 5 Servos + 5 INA226 Current Sensors (via PCA9548A) + 9 FSR Live Readings
 
-This firmware runs on an **STM32F401 “Blackpill”** and provides:
+This firmware runs on an **STM32F401 “Blackpill”** using the **Arduino framework**.
 
-- **5 finger servos** driven together (shared pulse width)
-- **5 INA226 current sensors** (one per finger motor) behind a **PCA9548A I2C multiplexer**
+It provides:
+- **5 servos** (all fingers move together with the same pulse width)
+- **5 INA226 current sensors** (one per servo motor) using a **PCA9548A I2C multiplexer**
 - **9 FSR sensors** read as analog inputs and printed live
-- **Non‑blocking servo sweeps** + **serial command control**
-- **Fixed‑format current logging** designed for parsing (Python/CSV)
+- **Non-blocking servo sweeps** controlled by **Serial commands (0–4)**
+- **Fixed-format current logs** suitable for Python/CSV parsing
 
 ---
 
-## 1) Hardware overview
+## Hardware mapping
 
-### I2C bus
+### I2C bus (STM32 → PCA9548A → INA226)
 - **SCL:** PB8  
 - **SDA:** PB9  
 - **PCA9548A address:** `0x70`  
 - **INA226 address (each channel):** `0x40`
 
 ### Servo pins (5 fingers)
-| Finger | Servo Pin | PCA Channel (INA) |
-|---|---:|---:|
-| Pinky  | PB13 | 0 |
-| Ring   | PB14 | 1 |
-| Middle | PB15 | 2 |
-| Index  | PA8  | 3 |
-| Thumb  | PA11 | 4 |
+| Servo | Finger | MCU Pin | INA Channel |
+|---:|---|---|---:|
+| S0 | Pinky  | PB13 | 0 |
+| S1 | Ring   | PB14 | 1 |
+| S2 | Middle | PB15 | 2 |
+| S3 | Index  | PA8  | 3 |
+| S4 | Thumb  | PA11 | 4 |
 
-### FSR analog pins (9 sensors)
+### FSR pins (9 analog inputs)
 `PB0, PA7, PA6, PA5, PA4, PA3, PA2, PA1, PA0`
 
 ---
 
-## 2) Overall process (step‑by‑step)
+## IMPORTANT: Reading/printing frequency
 
-### A) Boot / Initialization (`setup()`)
-1. Start Serial at **115200**.
-2. Configure I2C on **PB8/PB9** and call `Wire.begin()`.
-3. Initialize INA226 sensors through the PCA9548A:
-   - Select PCA channel **0 → 4**
-   - Check device presence at `0x40`
-   - Run `ina226.init()`
-   - If any channel fails → print an error and **halt**
-4. Servos start **DISABLED at boot** (not attached) to prevent startup jumps.
-5. Configure all 9 FSR pins as `INPUT_ANALOG`.
-6. Print the command menu.
-
-### B) Main loop (`loop()`)
-The loop continuously performs three tasks in parallel:
-
-1. **Handle user serial commands** (`0–4`)
-2. **Update servo sweep state machine** (non‑blocking)
-3. **Print INA226 currents + FSR readings periodically** at fixed intervals
-
----
-
-## 3) User commands (Serial Monitor)
-
-Open Serial Monitor at **115200 baud** and send one character:
-
-| Command | Action | Notes |
-|---:|---|---|
-| `0` | **Sweep** from **2400 → 1200 µs** | “Spread → bend” sweep |
-| `1` | **Sweep** from **1200 → 2400 µs** | “Bend → spread” sweep |
-| `2` | **Instant move** to **2400 µs** | No sweep |
-| `3` | Step **−300 µs** | Limited by `SERVO_MIN_US` |
-| `4` | Step **+300 µs** | Limited by `SERVO_MAX_US` |
-
-### Servo attach behavior (important)
-- The first time you send any servo command, the firmware calls **`attachServosOnce()`**.
-- This attaches all 5 servos only once, then motion starts.
-- This avoids sudden “jumping” at startup.
-
-### Sweep behavior (non‑blocking)
-Sweeps run in the background using a timer:
-- Each sweep “step” happens every **`SWEEP_DELAY_MS = 3000 ms`**
-- Step size is **`SERVO_STEP = 300 µs`**
-- While sweeping, **FSR and current printing continue**.
-
----
-
-## 4) Sensor read frequency (IMPORTANT)
-
-This code is designed so **currents and FSR readings are printed at a controlled rate**.
-
-### A) Current readings (INA226)
-Current print period:
+### Current readings (INA226)
 ```cpp
 #define CURRENT_PRINT_PERIOD_MS 200
 ```
+- Prints current data every **200 ms**
+- That is **5 lines per second (5 Hz)**  
+- Each line includes **all 5 INA channels** (S0…S4)
 
-- **Expected print rate:** ~**5 Hz** (one line every 200 ms)
-- Each print reads **5 channels** by selecting PCA channels 0..4 and calling `getCurrent_mA()`.
+### FSR readings
+```cpp
+#define FSR_PRINT_PERIOD_MS 200
+```
+- Prints FSR data every **200 ms**
+- That is **5 lines per second (5 Hz)**
+- Each line includes **all 9 FSR pins**
 
-**Fixed current log format (do not change if you parse in Python):**
+### Sweep speed (when sweeping)
+```cpp
+#define SERVO_STEP     10      // µs per step
+#define SWEEP_DELAY_MS 10      // ms between steps
+```
+- Sweep updates every **10 ms**
+- Pulse changes by **10 µs** each update  
+- Approx. sweep rate: **1000 µs per second**
+
+---
+
+## User commands (Serial Monitor)
+
+Open Serial Monitor at **115200 baud** and send one character:
+
+| Command | Action | Description |
+|---:|---|---|
+| `0` | Sweep bend | sweep **2400 → 500 µs** |
+| `1` | Sweep straight | sweep **500 → 2400 µs** |
+| `2` | Instant straight | move instantly to **2400 µs** |
+| `3` | Step down | pulse **−10 µs** |
+| `4` | Step up | pulse **+10 µs** |
+
+The firmware prints `Received: X` when you type a command, then `Enter next command:`.
+
+---
+
+## Step-by-step code explanation
+
+### 1) Libraries
+```cpp
+#include <Wire.h>
+#include <Servo.h>
+#include <INA226_WE.h>
+```
+- `Wire`: I2C communication for PCA9548A + INA226
+- `Servo`: servo PWM generation
+- `INA226_WE`: INA226 current sensor library
+
+---
+
+### 2) Constants (addresses, pins, timing)
+- Sets the I2C addresses:
+  - `PCA9548A_ADDRESS = 0x70`
+  - `INA226_ADDRESS = 0x40`
+- Defines the 5 servo pins and servo pulse range:
+  - `SERVO_MIN_US = 500`
+  - `SERVO_MAX_US = 2400`
+- Sets sweep and print timing:
+  - `SWEEP_DELAY_MS = 10`
+  - `CURRENT_PRINT_PERIOD_MS = 200`
+  - `FSR_PRINT_PERIOD_MS = 200`
+
+---
+
+### 3) Global objects
+- Creates 5 `Servo` objects (`servo0…servo4`)
+- Creates 5 `INA226_WE` objects (`ina226_0…ina226_4`)
+  - They all use address `0x40`, but each one is reached by selecting a different PCA channel.
+
+---
+
+### 4) Servos do NOT move on boot (attach-on-demand)
+```cpp
+bool servosEnabled = false;
+void attachServosOnce() { ... }
+```
+- Servos are attached only when a command needs motion.
+- This helps prevent unexpected servo jumps at startup.
+
+---
+
+### 5) PCA9548A channel selection
+```cpp
+void selectPCAChannel(uint8_t channel)
+```
+- Writes `1 << channel` to PCA9548A
+- This connects that channel to the I2C bus so the INA226 on that channel can be read.
+
+---
+
+### 6) INA226 presence + error handling
+```cpp
+bool inaPresentOnCurrentBus()
+void checkForI2cErrors(INA226_WE &sensor)
+```
+- Presence check makes sure a device responds at `0x40`.
+- `checkForI2cErrors()` halts the program if the INA library reports an I2C error code.
+
+---
+
+### 7) Printing current data (all 5 channels)
+```cpp
+void printINA226Data()
+```
+Steps:
+1. Select PCA channel 0 → read current → error check
+2. Repeat for channels 1..4
+3. Print a single line in a fixed format:
+
+**Current line format (fixed):**
 ```
 millis,pulse,S0=.. mA, S1=.. mA, S2=.. mA, S3=.. mA, S4=.. mA
 ```
 
-Example:
-```
-12345,2400,S0=420 mA, S1=390 mA, S2=410 mA, S3=405 mA, S4=398 mA
-```
+---
 
-### B) FSR readings
-FSR print period:
+### 8) Servo movement
+#### Instant move
 ```cpp
-#define FSR_PRINT_PERIOD_MS 200
+void moveServoUS(int pulseWidth)
 ```
+- Attaches servos (first time only)
+- Stops any sweep
+- Applies one pulse width to all 5 servos
 
-- **Expected print rate:** ~**5 Hz** (one line every 200 ms)
-- Each line reads **all 9 FSR pins** with `analogRead()` and prints in one line:
-
-Example:
+#### Non-blocking sweep
+```cpp
+void startSweep(...)
+void updateSweep()
 ```
-FSR Live: PB0=812.00, PA7=799.00, PA6=805.00, PA5=810.00, PA4=808.00, PA3=820.00, PA2=815.00, PA1=802.00, PA0=798.00
-```
-
-✅ You can change the rates by editing:
-- `CURRENT_PRINT_PERIOD_MS`
-- `FSR_PRINT_PERIOD_MS`
+- `startSweep()` sets starting pulse, target, direction, and timing.
+- `updateSweep()` advances the sweep only when the next step time is reached.
+- Because it is non-blocking, sensor printing continues during sweeps.
 
 ---
 
-## 5) Key tunable parameters
-
-### Servo motion
+### 9) FSR live printing (9 sensors)
 ```cpp
-#define SERVO_MIN_US 1200
-#define SERVO_MAX_US 2400
-#define SERVO_STEP   300
-#define SWEEP_DELAY_MS 3000
+void printFSRLive()
 ```
-
-### Print frequency
-```cpp
-#define CURRENT_PRINT_PERIOD_MS 200
-#define FSR_PRINT_PERIOD_MS     200
+- Reads all 9 analog pins using `analogRead()`
+- Prints one single line:
+```
+FSR Live: PB0=..., PA7=..., ... , PA0=...
 ```
 
 ---
 
-## 6) Dependencies
+### 10) Setup sequence (`setup()`)
+1. Start Serial (115200)
+2. Set I2C pins (PB9 SDA, PB8 SCL) and start Wire
+3. Initialize INA226 on PCA channels 0..4 (halt if any fail)
+4. Print servo pin mapping and command menu
+5. Configure FSR pins as analog inputs
 
-- Arduino STM32 Core
-- `Wire` (built‑in)
+---
+
+### 11) Main loop (`loop()`) — what happens every cycle
+1. **Check for Serial command**
+2. **Update sweep state machine**
+3. **Print INA currents every 200 ms (5 Hz)**
+4. **Print FSR readings every 200 ms (5 Hz)**
+
+---
+
+## Dependencies
+- Arduino STM32 core
+- `Wire` (built-in)
 - `Servo`
 - `INA226_WE`
 
-Install `INA226_WE` via **PlatformIO Library Registry** or Arduino Library Manager.
+---
+
+## Tips / troubleshooting
+- If Serial output is too fast, increase the print periods:
+  - `CURRENT_PRINT_PERIOD_MS`
+  - `FSR_PRINT_PERIOD_MS`
+- Keep I2C wiring short, and use proper pull-ups.
+- Use a strong 5V supply for servos and good decoupling to avoid resets.
 
 ---
 
-## 7) Practical notes
-
-- Servos can cause supply noise. Use a solid 5V supply and good bulk capacitors near servos.
-- INA226 accuracy depends on your shunt resistor and layout.
-- FSR readings are analog and may fluctuate; filtering/averaging can be added later.
-
----
-
-## 8) License
-Free to use and modify for academic, personal, and robotics prototyping work.
+## License
+Free to use and modify for academic/personal robotics projects.
