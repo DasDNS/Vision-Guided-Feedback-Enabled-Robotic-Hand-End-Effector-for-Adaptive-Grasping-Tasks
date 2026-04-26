@@ -21,12 +21,12 @@
 #define SERVO3_PIN PA8   // Index  (INA channel 3)
 #define SERVO4_PIN PA11  // Thumb  (INA channel 4)
 
-#define SERVO_MIN_US 1200
+#define SERVO_MIN_US 500
 #define SERVO_MAX_US 2400
-#define SERVO_STEP   300
+#define SERVO_STEP   10
 
 // Sweep delay between steps (your value)
-#define SWEEP_DELAY_MS 3000
+#define SWEEP_DELAY_MS 10
 
 // Choose current print frequency (5 times per 1 second)
 #define CURRENT_PRINT_PERIOD_MS 200
@@ -386,4 +386,3 @@ void loop() {
     printFSRLive();
   }
 }
-
