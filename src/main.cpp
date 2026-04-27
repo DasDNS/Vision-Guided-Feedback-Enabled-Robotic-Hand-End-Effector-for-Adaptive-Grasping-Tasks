@@ -23,10 +23,12 @@
 
 #define SERVO_MIN_US 500
 #define SERVO_MAX_US 2400
-#define SERVO_STEP   10
 
-// Sweep delay between steps (your value)
-#define SWEEP_DELAY_MS 10
+// NEW — desired full travel time (2400 ↔ 500)
+#define FULL_SWEEP_TIME_SEC 8.0f
+
+// Command 3/4 step size (instant)
+#define SERVO_STEP   10
 
 // Choose current print frequency (5 times per 1 second)
 #define CURRENT_PRINT_PERIOD_MS 200
@@ -60,12 +62,22 @@ unsigned long lastFSRPrint = 0;
 bool servosEnabled = false;
 
 // ===============================
-// [NEW] SWEEP STATE MACHINE
+// SPEED-BASED RAMP STATE
 // ===============================
-bool sweepActive = false;
-int  sweepTargetEnd = SERVO_MAX_US;
-int  sweepStep = SERVO_STEP;              // signed step while sweeping
-unsigned long nextSweepStepAt = 0;        // millis() when next sweep step should happen
+bool rampActive = false;
+int  rampTargetUs = SERVO_MAX_US;
+
+// Current position stored as float for smooth dt integration
+float rampPosUs = (float)SERVO_MAX_US;
+
+// timing for dt
+unsigned long lastRampUpdateMs = 0;
+
+// ===============================
+// AUTO SPEED CALCULATION (set once)
+// ===============================
+float fullTravelUs = (float)(SERVO_MAX_US - SERVO_MIN_US);   // 1900
+float autoRampSpeedUsPerSec = fullTravelUs / FULL_SWEEP_TIME_SEC;
 
 // ===============================
 // SERVO ATTACH (no movement on boot)
@@ -163,7 +175,7 @@ void printINA226Data() {
 }
 
 // ===============================
-// MOVE ALL SERVOS (single target)
+// APPLY SERVO PULSE (clamped)
 // ===============================
 void applyServoPulseUS(int pulseWidth) {
   if (pulseWidth < SERVO_MIN_US) pulseWidth = SERVO_MIN_US;
@@ -181,57 +193,65 @@ void applyServoPulseUS(int pulseWidth) {
   servo4.writeMicroseconds(currentPulseWidth);
 }
 
+// ===============================
+// INSTANT MOVE (stop ramp)
+// ===============================
 void moveServoUS(int pulseWidth) {
   attachServosOnce();
-  sweepActive = false; // stop any sweep
-  applyServoPulseUS(pulseWidth);
+  rampActive = false; // stop any ramp
+
+  if (pulseWidth < SERVO_MIN_US) pulseWidth = SERVO_MIN_US;
+  if (pulseWidth > SERVO_MAX_US) pulseWidth = SERVO_MAX_US;
+
+  rampPosUs = (float)pulseWidth; // keep ramp position synced
+  applyServoPulseUS((int)roundf(rampPosUs));
 }
 
 // ===============================
-// [NEW] START SWEEP (non-blocking)
+// START SPEED-BASED RAMP
 // ===============================
-void startSweep(int startUs, int endUs, int stepUs) {
+void startRampTo(int targetUs, float speedUsPerSec) {
   attachServosOnce();
 
-  if (startUs < SERVO_MIN_US) startUs = SERVO_MIN_US;
-  if (startUs > SERVO_MAX_US) startUs = SERVO_MAX_US;
-  if (endUs < SERVO_MIN_US) endUs = SERVO_MIN_US;
-  if (endUs > SERVO_MAX_US) endUs = SERVO_MAX_US;
+  if (targetUs < SERVO_MIN_US) targetUs = SERVO_MIN_US;
+  if (targetUs > SERVO_MAX_US) targetUs = SERVO_MAX_US;
 
-  // Set the starting position immediately
-  applyServoPulseUS(startUs);
+  if (speedUsPerSec < 1.0f) speedUsPerSec = 1.0f;
 
-  sweepTargetEnd = endUs;
+  rampTargetUs = targetUs;
 
-  int dir = (endUs >= startUs) ? 1 : -1;
-  sweepStep = abs(stepUs) * dir;
+  // start from current position
+  rampPosUs = (float)currentPulseWidth;
 
-  sweepActive = true;
-  nextSweepStepAt = millis() + SWEEP_DELAY_MS; // first increment after delay
+  rampActive = true;
+  lastRampUpdateMs = millis();
 }
 
 // ===============================
-// [NEW] UPDATE SWEEP (call from loop)
+// UPDATE SPEED-BASED RAMP (call from loop)
 // ===============================
-void updateSweep() {
-  if (!sweepActive) return;
+void updateRamp() {
+  if (!rampActive) return;
 
   unsigned long now = millis();
-  if (now < nextSweepStepAt) return;
+  unsigned long dtMs = now - lastRampUpdateMs;
+  if (dtMs == 0) return;
+  lastRampUpdateMs = now;
 
-  int nextPw = currentPulseWidth + sweepStep;
+  float dt = dtMs / 1000.0f; // seconds
 
-  // Check if we reached/passed end
-  if ((sweepStep > 0 && nextPw >= sweepTargetEnd) ||
-      (sweepStep < 0 && nextPw <= sweepTargetEnd)) {
+  float diff = (float)rampTargetUs - rampPosUs;
+  float step = autoRampSpeedUsPerSec * dt; // <-- auto speed based on FULL_SWEEP_TIME_SEC
 
-    applyServoPulseUS(sweepTargetEnd);
-    sweepActive = false;   // done
+  if (fabsf(diff) <= step) {
+    rampPosUs = (float)rampTargetUs;
+    applyServoPulseUS((int)roundf(rampPosUs));
+    rampActive = false;
     return;
   }
 
-  applyServoPulseUS(nextPw);
-  nextSweepStepAt = now + SWEEP_DELAY_MS;
+  rampPosUs += (diff > 0.0f) ? step : -step;
+  applyServoPulseUS((int)roundf(rampPosUs));
 }
 
 // ======================================================
@@ -314,12 +334,17 @@ void setup() {
   }
 
   Serial.println("\n📟 Serial Commands Reference");
-  Serial.println("0 → Fully bent (sweep from 2400 to 500)");
-  Serial.println("1 → Fully straight (sweep from 500 to 2400)");
+  Serial.println("0 → Fully bent (ramp from 2400 to 500)");
+  Serial.println("1 → Fully straight (ramp from 500 to 2400)");
   Serial.println("2 → Fully straight (instant)");
-  Serial.println("3 → Step −300 µs");
-  Serial.println("4 → Step +300 µs");
+  Serial.println("3 → Step −10 µs (instant)");
+  Serial.println("4 → Step +10 µs (instant)");
   Serial.println("------------------------------");
+  Serial.print("FULL_SWEEP_TIME_SEC = ");
+  Serial.print(FULL_SWEEP_TIME_SEC);
+  Serial.print(" s, autoRampSpeedUsPerSec = ");
+  Serial.print(autoRampSpeedUsPerSec);
+  Serial.println(" us/s");
   Serial.println("Enter command:");
 }
 
@@ -338,13 +363,13 @@ void loop() {
 
     switch (cmd) {
       case '0':
-        // Start non-blocking sweep: spread -> bend
-        startSweep(SERVO_MAX_US, SERVO_MIN_US, SERVO_STEP);
+        // ramp down using auto speed
+        startRampTo(SERVO_MIN_US, autoRampSpeedUsPerSec);
         break;
 
       case '1':
-        // Start non-blocking sweep: bend -> spread
-        startSweep(SERVO_MIN_US, SERVO_MAX_US, SERVO_STEP);
+        // ramp up using auto speed
+        startRampTo(SERVO_MAX_US, autoRampSpeedUsPerSec);
         break;
 
       case '2':
@@ -371,8 +396,8 @@ void loop() {
     Serial.println("Enter next command:");
   }
 
-  // ---- Update sweep state machine (non-blocking) ----
-  updateSweep();
+  // ---- Update speed-based ramp (non-blocking) ----
+  updateRamp();
 
   // ---- Periodic current print (always, fixed format for your Python parser) ----
   if (millis() - lastCurrentPrint >= CURRENT_PRINT_PERIOD_MS) {
