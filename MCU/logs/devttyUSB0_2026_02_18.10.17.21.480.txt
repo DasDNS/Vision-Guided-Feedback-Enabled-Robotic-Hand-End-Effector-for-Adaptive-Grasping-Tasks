@@ -1,0 +1,10 @@
+Enter command:
+1 = LED ON
+0 = LED OFF
+2 = BLINK
+Enter command:
+1 = LED ON
+0 = LED OFF
+2 = BLINK
+Received: 121
+Invalid command

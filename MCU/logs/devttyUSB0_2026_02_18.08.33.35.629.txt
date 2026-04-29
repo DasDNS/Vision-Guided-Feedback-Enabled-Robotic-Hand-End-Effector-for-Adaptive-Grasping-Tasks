@@ -1,0 +1,4 @@
+STM32 UART LED control ready.
+Type: ON / OFF / BLINK / HELP
+STM32 UART LED control ready.
+Type: ON / OFF / BLINK / HELP

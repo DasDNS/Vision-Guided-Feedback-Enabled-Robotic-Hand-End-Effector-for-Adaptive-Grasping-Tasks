@@ -1,261 +1,254 @@
-# STM32 Robotic Hand Control System
-## Speed-Based Servo Ramp + INA226 Current Sensing + FSR Monitoring
+# STM32 Robotic Hand Serial Monitor + Filtered UI (FSR + Current + Servo/INA Control)
 
-This firmware runs on an **STM32F401 Blackpill** and controls:
+This repository contains **two cooperating programs**:
 
-- **5 Servo motors** (robotic fingers)
-- **5 INA226 current sensors** (one per motor)
-- **PCA9548A I2C multiplexer** (to access multiple INA226 devices sharing the same I2C address)
-- **9 FSR force sensors** (analog inputs)
-- **Serial command interface** for user control
+1. **STM32 firmware (Arduino framework)** controlling:
+   - 5 servos (pinky→thumb)
+   - 5 INA226 current sensors via PCA9548A I2C mux (channels 0..4)
+   - 9 FSR sensors (analog inputs) on the palm
+   - Smooth “speed-based ramp” motion (FULL_SWEEP_TIME_SEC configurable)
+   - Continuous serial streaming of **Current** and **FSR** readings
 
----
-
-# Motion Control Method Used
-
-## Method 2 — Speed-Based Ramp (Emphasized)
-
-This project uses a **speed-based ramp motion control method** for servo actuation.
-
-Instead of moving servos in fixed steps with delays, the system:
-
-1. Sets a **target pulse width** (µs)
-2. Continuously moves the current pulse toward that target
-3. Updates motion based on elapsed time (`dt`)
-4. Controls speed in **µs per second**
-
-This produces smoother, time-controlled motion.
+2. **Python desktop UI (PySide6)** providing:
+   - Serial connection management + auto-detect
+   - “Quick Controls” buttons (0..4) for servo commands
+   - Serial-monitor style command sending (custom line endings)
+   - **Message filtering** into separate panels:
+     - FSR panel (`FSR Live:` lines)
+     - Current panel (fixed CSV-like INA format)
+     - Status/Other panel (everything else)
+   - Debug log + UI clearing
+   - Line limiting to avoid UI slowdowns under heavy serial output
 
 ---
 
-## Concept Explanation
+## 🧠 System Architecture
 
-Traditional ramp (Method 1):
+STM32 (UART @115200)  ⇄  USB-Serial  ⇄  PC (PySide6 UI)
 
-- `pulse += step`
-- `delay(ms)`
+The STM32 prints two periodic streams:
+- **Current stream** (INA226 channels 0..4)
+- **FSR stream** (9 analog channels)
 
-Speed-based ramp (Method 2 — used here):
-
-- `diff = target − current`
-- `step = speed × dt`
-- `current += step`
-
-Where:
-
-- `speed` = µs per second  
-- `dt` = elapsed time since last update  
-- Motion is continuous and time-scaled
+The Python UI reads each line and routes it to the correct panel based on prefix/format.
 
 ---
 
-# Why Method 2 Is Used
+# 1) STM32 Firmware
 
-This method provides:
+## ✅ Hardware Features Used
 
-- Precise motion timing
-- Smooth motion (no big “jumps”)
-- Lower current spikes (important for MG996R / high-torque servos)
-- Better grip stability (less vibration = cleaner FSR readings)
-- Cleaner control math (speed is directly tunable)
+### Servos (5)
+| Servo | Finger | Pin |
+|------:|--------|-----|
+| S0 | Pinky  | PB13 |
+| S1 | Ring   | PB14 |
+| S2 | Middle | PB15 |
+| S3 | Index  | PA8  |
+| S4 | Thumb  | PA11 |
 
-Ideal for prosthetic and robotic hands.
+### I2C Bus
+- SDA: **PB9**
+- SCL: **PB8**
+- PCA9548A mux: **0x70**
+- INA226 sensors: **0x40** on mux channels 0..4
+
+### FSR Sensors (9 analog)
+Pins:  
+`PB0, PA7, PA6, PA5, PA4, PA3, PA2, PA1, PA0`
 
 ---
 
-# Auto Speed Calculation
+## 🌀 Servo Motion Model (Speed-based Ramp)
 
-Defined in code:
+The firmware uses a **speed-based ramp** (smooth motion) instead of step+delay.
 
+### Speed setting
+Set desired full travel time:
 ```cpp
 #define FULL_SWEEP_TIME_SEC 8.0f
 ```
 
-Full travel is:
-
-- `SERVO_MAX_US (2400) → SERVO_MIN_US (500)`
-- Travel distance = `1900 µs`
-
-Automatic speed:
-
-- `1900 / 8 ≈ 237.5 µs/sec`
-
-So a full finger close/open takes approximately **8 seconds**.
-
----
-
-# Serial Commands
-
-Open Serial Monitor at **115200 baud** and send one character:
-
-| Command | Action | Motion type |
-|---:|---|---|
-| `0` | Ramp to fully bent | speed-based ramp |
-| `1` | Ramp to fully straight | speed-based ramp |
-| `2` | Instant mid move (1450 µs) | instant |
-| `3` | Step −10 µs | instant |
-| `4` | Step +10 µs | instant |
-
----
-
-# Sensor Monitoring (Frequency Emphasis)
-
-## Current (INA226)
-Printed every:
-
+Firmware computes ramp speed automatically:
 ```cpp
-#define CURRENT_PRINT_PERIOD_MS 200
+autoRampSpeedUsPerSec = (SERVO_MAX_US - SERVO_MIN_US) / FULL_SWEEP_TIME_SEC;
 ```
 
-- **200 ms → 5 Hz**
-- Each line reads all 5 channels (S0–S4)
+`updateRamp()` runs in the main loop using `dt` integration.
 
-Format (fixed, good for Python parsing):
+### Why this is good
+- Non-blocking (does not pause loop)
+- Smooth motion independent of loop speed
+- Changing one constant changes overall speed reliably
+
+---
+
+## 🧾 Firmware Serial Output Formats (Important)
+
+### ✅ Current (INA226) output format (fixed)
+This format is required for Python classification:
 
 ```
-millis,pulse,S0=.. mA, S1=.. mA, S2=.. mA, S3=.. mA, S4=.. mA
+millis,pulse,S0=... mA, S1=... mA, S2=... mA, S3=... mA, S4=... mA
 ```
 
-## FSR (Analog)
+Example:
+```
+26780,2400,S0=5.25 mA, S1=5.32 mA, S2=4.90 mA, S3=5.25 mA, S4=5.30 mA
+```
+
 Printed every:
-
 ```cpp
-#define FSR_PRINT_PERIOD_MS 200
+#define CURRENT_PRINT_PERIOD_MS 200   // 5 Hz
 ```
 
-- **200 ms → 5 Hz**
-- Each line prints all 9 FSR readings with pin labels:
-
+### ✅ FSR live output format (fixed)
 ```
-FSR Live: PB0=..., PA7=..., ... , PA0=...
+FSR Live: PB0=..., PA7=..., ..., PA0=...
 ```
 
----
+Example:
+```
+FSR Live: PB0=0.00, PA7=15.00, PA6=0.00, ...
+```
 
-# Dependencies
-
-- Arduino STM32 Core
-- `Wire`
-- `Servo`
-- `INA226_WE`
-
----
-
-# What the code does (step-by-step)
-
-This section describes the **actual runtime sequence** of the firmware from boot to continuous operation.
-
-## 1) Startup / Boot (`setup()`)
-
-1. **Start Serial**
-   - `Serial.begin(115200);`
-   - Prints the banner and a command reference to the Serial Monitor.
-
-2. **Initialize I2C bus**
-   - Sets I2C pins:
-     - SDA = **PB9**
-     - SCL = **PB8**
-   - Calls `Wire.begin()`.
-
-3. **Initialize INA226 sensors through PCA9548A (channels 0..4)**
-   For each channel `0 → 4`:
-   - Select channel on PCA9548A using `selectPCAChannel(ch)`
-   - Check if an INA226 responds at `0x40` using `inaPresentOnCurrentBus()`
-   - Initialize that INA226 object using `ina226_x.init()`
-   - If any sensor is missing or init fails:
-     - Print an error message
-     - **Halt forever** with `while(1){}` (safety behavior)
-
-4. **Wait for conversions once (optional stabilization)**
-   - Calls `waitUntilConversionCompleted()` for each INA226 channel.
-
-5. **Servo safety at boot**
-   - Servos are **not attached** during `setup()`.
-   - This prevents sudden motion when the MCU powers on.
-   - The code prints: “Servos DISABLED at boot…”
-
-6. **FSR pin setup**
-   - Configures 9 pins as `INPUT_ANALOG`:
-     - `PB0, PA7, PA6, PA5, PA4, PA3, PA2, PA1, PA0`
-
-7. **Print command menu + computed ramp speed**
-   - Prints:
-     - Available commands (0–4)
-     - `FULL_SWEEP_TIME_SEC`
-     - `autoRampSpeedUsPerSec`
+Printed every:
+```cpp
+#define FSR_PRINT_PERIOD_MS 200       // 5 Hz
+```
 
 ---
 
-## 2) Continuous operation (`loop()`)
+## 🎮 Firmware Serial Commands (0–4)
 
-The main loop performs **four tasks repeatedly**:
+> Firmware reads **one character at a time** using `Serial.read()`.
 
-### Task A — Read user command (Serial)
-- If a character arrives:
-  1. Print `Received: <cmd>`
-  2. Execute servo command:
+| Command | Action |
+|--------:|--------|
+| `0` | Ramp to **SERVO_MIN_US** (fully bent: 2400 → 500) |
+| `1` | Ramp to **SERVO_MAX_US** (fully straight: 500 → 2400) |
+| `2` | Instant move to **SERVO_MAX_US** |
+| `3` | Instant step **−10 µs** |
+| `4` | Instant step **+10 µs** |
 
-**Command behavior**
-- `0`: start ramp to `SERVO_MIN_US` (500 µs)
-- `1`: start ramp to `SERVO_MAX_US` (2400 µs)
-- `2`: instant move to **1450 µs**
-- `3`: instant step down by **10 µs**
-- `4`: instant step up by **10 µs**
-
-After handling, prints: `Enter next command:`
-
-### Task B — Update the speed-based ramp (non-blocking)
-- `updateRamp()` runs every loop.
-- If a ramp is active:
-  1. Compute elapsed time `dt` from `millis()`
-  2. Compute how far we are from the target (diff)
-  3. Compute allowed movement:
-     - `step = autoRampSpeedUsPerSec * dt`
-  4. Move `rampPosUs` toward `rampTargetUs`
-  5. Stop ramp when target is reached
-
-✅ Because it is **non-blocking**, the MCU can still read sensors and print logs while moving.
-
-### Task C — Print INA226 currents periodically (5 Hz)
-- Every **200 ms**:
-  - Reads channel 0..4 (select PCA channel each time)
-  - Prints a single current line in fixed format
-
-### Task D — Print FSR readings periodically (5 Hz)
-- Every **200 ms**:
-  - Reads all 9 analog pins using `analogRead()`
-  - Prints one single-line message with pin labels
+**Servo attach-on-demand:** servos do not attach at boot. They attach only after first command.
 
 ---
 
-## 3) Summary (runtime behavior)
+# 2) Python PySide6 UI
 
-1. User sends command  
-2. Servos attach (first command only)  
-3. Ramp or instant motion is applied  
-4. Currents continue printing at **5 Hz**  
-5. FSR readings continue printing at **5 Hz**  
-6. Ramp completes smoothly based on **FULL_SWEEP_TIME_SEC**  
+## ✅ UI Features
+- Port refresh + auto detect (`/dev/ttyUSB*` or `/dev/ttyACM*`)
+- Connect/disconnect with “exclusive” serial lock
+- Quick buttons for 0..4 commands (sends exactly 1 byte, no line ending)
+- Manual send box with selectable line endings (NONE/LF/CR/CRLF)
+- 4 output panels:
+  - **FSR Values**
+  - **Current Values**
+  - **Status / Other**
+  - **Debug Log**
+- “Clear UI” button clears all panels
+- Line limiting to keep UI responsive during 5 Hz + 5 Hz streaming
+
+---
+
+## 🧠 Message Filtering Rules
+
+Python classifies each received line as:
+
+1) **FSR**
+- Starts with `FSR Live:`
+
+2) **Current**
+- Matches the INA output regex:
+```text
+^\d+,\d+,S0=.*mA, S1=.*mA, S2=.*mA, S3=.*mA, S4=.*mA$
+```
+
+3) **Status**
+- Everything else (servo state messages, init logs, errors, etc.)
 
 ---
 
-## Troubleshooting notes
+# 🛠️ Requirements
 
-- If the output is “too fast”, increase:
-  - `CURRENT_PRINT_PERIOD_MS`
-  - `FSR_PRINT_PERIOD_MS`
-- If INA226 init halts:
-  - Check PCA9548A wiring and address `0x70`
-  - Ensure each INA226 is connected to the correct PCA channel
-  - Confirm the INA226 address is `0x40`
-- If servos move unexpectedly:
-  - Ensure you power servos from a stable 5V supply
-  - Keep servo ground tied to MCU ground (common ground)
-  
----
+## Firmware
+- STM32 “Black Pill” (or compatible)
+- Arduino STM32 core (or PlatformIO)
+- PCA9548A I2C mux + 5× INA226 sensors
+- 5 servo motors
+- 9 FSR sensors wired to analog pins
 
-# License
-
-Open-source for robotics and prosthetics research.
+## Python
+Install dependencies:
+```bash
+pip install PySide6 pyserial
+```
 
 ---
+
+# ▶️ How to Run
+
+## 1) Flash STM32 firmware
+Upload the C++ sketch to STM32.
+
+Use serial at:
+- **115200 baud**
+- **No line ending** recommended for commands 0..4
+
+## 2) Run the Python UI
+```bash
+python3 hand_control_ui.py
+```
+
+## 3) Connect and test
+1. Click **Refresh Ports**
+2. (Optional) **Auto-Detect**
+3. Click **Connect**
+4. Press quick buttons (0..4)
+5. Watch:
+   - FSR panel updating at 5 Hz
+   - Current panel updating at 5 Hz
+   - Status panel showing servo state + other messages
+
+---
+
+# ⚠️ Serial Flood / USB-TTL Stability Notes
+
+If USB-TTL adapters disconnect/crash, common causes:
+
+- Printing too fast (flooding buffers)
+- Poor grounding / power noise from servos
+- Cheap adapter overheating / brownouts
+- Servo power sharing with USB without isolation
+
+### This project reduces risk by:
+✅ Fixed-rate printing (`200 ms` periods)  
+✅ Line-based reading (`readline()`)  
+✅ UI line limiting to keep the PC responsive
+
+### Best practices
+- Use a **separate power supply** for servos
+- Tie grounds properly (servo PSU GND ↔ STM32 GND ↔ USB GND)
+- Add decoupling on servo rail (470–1000 µF + 0.1 µF)
+- If needed: reduce print rate or raise baud (e.g., 230400)
+
+---
+
+# 📁 Suggested File Layout
+
+```
+.
+├── firmware/
+│   └── stm32_hand_firmware.ino
+├── ui/
+│   └── hand_control_ui.py
+└── README.md
+```
+
+---
+
+# 👩‍💻 Author
+**Dasuni Saparamadu**  
+Embedded Software / Firmware Engineer  
+Sri Lanka 🇱🇰
