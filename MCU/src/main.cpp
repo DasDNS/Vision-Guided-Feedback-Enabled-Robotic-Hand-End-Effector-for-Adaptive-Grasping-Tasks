@@ -21,10 +21,17 @@
 #define SERVO_MIN_US 500
 #define SERVO_MAX_US 2400
 
-// REQUIRED ramp time:
-#define FULL_SWEEP_TIME_SEC 10.0f
+// ===============================
+// PER-FINGER SWEEP TIMES (seconds)
+// Change these 5 values to tune each finger speed.
+// ===============================
+#define SWEEP_TIME_S0_SEC 10.0f  // Pinky
+#define SWEEP_TIME_S1_SEC 2.0f  // Ring
+#define SWEEP_TIME_S2_SEC 10.0f  // Middle
+#define SWEEP_TIME_S3_SEC 10.0f  // Index
+#define SWEEP_TIME_S4_SEC 10.0f  // Thumb
 
-// Choose current print frequency
+// Choose print frequency
 #define CURRENT_PRINT_PERIOD_MS 200
 #define FSR_PRINT_PERIOD_MS     200
 
@@ -33,6 +40,7 @@
 // ===============================
 Servo servo0, servo1, servo2, servo3, servo4;
 
+// One INA object per channel
 INA226_WE ina226_0(INA226_ADDRESS);
 INA226_WE ina226_1(INA226_ADDRESS);
 INA226_WE ina226_2(INA226_ADDRESS);
@@ -42,24 +50,39 @@ INA226_WE ina226_4(INA226_ADDRESS);
 // ===============================
 // GLOBAL VARIABLES
 // ===============================
-int currentPulseWidth = SERVO_MAX_US;
-
 unsigned long lastCurrentPrint = 0;
 unsigned long lastFSRPrint = 0;
 
 bool servosEnabled = false;
 
 // ===============================
-// SPEED-BASED RAMP STATE
+// PER-FINGER RAMP STATE
 // ===============================
-bool rampActive = false;
-int  rampTargetUs = SERVO_MAX_US;
-float rampPosUs = (float)SERVO_MAX_US;
-unsigned long lastRampUpdateMs = 0;
+static const int N_SERVOS = 5;
 
-// Auto speed based on FULL_SWEEP_TIME_SEC
-float fullTravelUs = (float)(SERVO_MAX_US - SERVO_MIN_US);   // 1900
-float autoRampSpeedUsPerSec = fullTravelUs / FULL_SWEEP_TIME_SEC;
+// Current pulse per finger (start at open)
+int currentPulseWidth[N_SERVOS] = {
+  SERVO_MAX_US, SERVO_MAX_US, SERVO_MAX_US, SERVO_MAX_US, SERVO_MAX_US
+};
+
+// Ramp state per finger
+bool  rampActive[N_SERVOS] = { false, false, false, false, false };
+int   rampTargetUs[N_SERVOS] = { SERVO_MAX_US, SERVO_MAX_US, SERVO_MAX_US, SERVO_MAX_US, SERVO_MAX_US };
+float rampPosUs[N_SERVOS] = {
+  (float)SERVO_MAX_US, (float)SERVO_MAX_US, (float)SERVO_MAX_US, (float)SERVO_MAX_US, (float)SERVO_MAX_US
+};
+unsigned long lastRampUpdateMs[N_SERVOS] = { 0, 0, 0, 0, 0 };
+
+// Auto speed per finger based on sweep time
+float fullTravelUs = (float)(SERVO_MAX_US - SERVO_MIN_US); // 1900
+
+float autoSpeedUsPerSec[N_SERVOS] = {
+  fullTravelUs / SWEEP_TIME_S0_SEC,
+  fullTravelUs / SWEEP_TIME_S1_SEC,
+  fullTravelUs / SWEEP_TIME_S2_SEC,
+  fullTravelUs / SWEEP_TIME_S3_SEC,
+  fullTravelUs / SWEEP_TIME_S4_SEC
+};
 
 // ===============================
 // SERVO ATTACH (no movement on boot)
@@ -100,8 +123,92 @@ void checkForI2cErrors(INA226_WE &sensor) {
   }
 }
 
-// Format MUST stay:
-// millis,pulse,S0=.. mA, S1=.. mA, S2=.. mA, S3=.. mA, S4=.. mA
+// ======================================================
+// APPLY PULSE TO ONE SERVO (clamped)
+// ======================================================
+static inline int clampPulse(int us) {
+  if (us < SERVO_MIN_US) return SERVO_MIN_US;
+  if (us > SERVO_MAX_US) return SERVO_MAX_US;
+  return us;
+}
+
+void applyServoPulseUS(int idx, int pulseWidth) {
+  pulseWidth = clampPulse(pulseWidth);
+  currentPulseWidth[idx] = pulseWidth;
+
+  // optional per-finger debug
+  Serial.print("Moving S");
+  Serial.print(idx);
+  Serial.print(" (us): ");
+  Serial.println(pulseWidth);
+
+  switch (idx) {
+    case 0: servo0.writeMicroseconds(pulseWidth); break;
+    case 1: servo1.writeMicroseconds(pulseWidth); break;
+    case 2: servo2.writeMicroseconds(pulseWidth); break;
+    case 3: servo3.writeMicroseconds(pulseWidth); break;
+    case 4: servo4.writeMicroseconds(pulseWidth); break;
+  }
+}
+
+// ======================================================
+// START RAMP FOR ALL FINGERS TO TARGET
+// ======================================================
+void startRampAllTo(int targetUs) {
+  attachServosOnce();
+
+  targetUs = clampPulse(targetUs);
+
+  unsigned long now = millis();
+  for (int i = 0; i < N_SERVOS; i++) {
+    rampTargetUs[i] = targetUs;
+    rampPosUs[i] = (float)currentPulseWidth[i]; // start from current pos
+    rampActive[i] = true;
+    lastRampUpdateMs[i] = now;
+  }
+}
+
+// ======================================================
+// UPDATE RAMPS (non-blocking) — each finger uses its own speed
+// ======================================================
+void updateRamps() {
+  for (int i = 0; i < N_SERVOS; i++) {
+    if (!rampActive[i]) continue;
+
+    unsigned long now = millis();
+    unsigned long dtMs = now - lastRampUpdateMs[i];
+    if (dtMs == 0) continue;
+    lastRampUpdateMs[i] = now;
+
+    float dt = dtMs / 1000.0f;
+
+    float diff = (float)rampTargetUs[i] - rampPosUs[i];
+    float step = autoSpeedUsPerSec[i] * dt;
+    if (step < 1.0f) step = 1.0f;
+
+    if (fabsf(diff) <= step) {
+      rampPosUs[i] = (float)rampTargetUs[i];
+      applyServoPulseUS(i, (int)roundf(rampPosUs[i]));
+      rampActive[i] = false;
+      continue;
+    }
+
+    rampPosUs[i] += (diff > 0.0f) ? step : -step;
+    applyServoPulseUS(i, (int)roundf(rampPosUs[i]));
+  }
+}
+
+// ======================================================
+// CURRENT PRINT (format must stay)
+// We keep "pulse" as a single integer so your Python regex works.
+// Here: print average pulse across 5 fingers.
+// ======================================================
+int getAveragePulse() {
+  long sum = 0;
+  for (int i = 0; i < N_SERVOS; i++) sum += currentPulseWidth[i];
+  return (int)(sum / N_SERVOS);
+}
+
 void printINA226Data() {
   float c0, c1, c2, c3, c4;
 
@@ -127,78 +234,23 @@ void printINA226Data() {
 
   Serial.print(millis());
   Serial.print(",");
-  Serial.print(currentPulseWidth);
+  //Serial.print(currentPulseWidth);
   Serial.print(",");
-  Serial.print("S0=");
+  Serial.print("Little=");
   Serial.print(c0);
   Serial.print(" mA, ");
-  Serial.print("S1=");
+  Serial.print("Ring=");
   Serial.print(c1);
   Serial.print(" mA, ");
-  Serial.print("S2=");
+  Serial.print("Middle=");
   Serial.print(c2);
   Serial.print(" mA, ");
-  Serial.print("S3=");
+  Serial.print("Index=");
   Serial.print(c3);
   Serial.print(" mA, ");
-  Serial.print("S4=");
+  Serial.print("Thumb=");
   Serial.print(c4);
   Serial.println(" mA");
-}
-
-void applyServoPulseUS(int pulseWidth) {
-  if (pulseWidth < SERVO_MIN_US) pulseWidth = SERVO_MIN_US;
-  if (pulseWidth > SERVO_MAX_US) pulseWidth = SERVO_MAX_US;
-
-  currentPulseWidth = pulseWidth;
-
-  Serial.print("Moving servos (us): ");
-  Serial.println(currentPulseWidth);
-
-  servo0.writeMicroseconds(currentPulseWidth);
-  servo1.writeMicroseconds(currentPulseWidth);
-  servo2.writeMicroseconds(currentPulseWidth);
-  servo3.writeMicroseconds(currentPulseWidth);
-  servo4.writeMicroseconds(currentPulseWidth);
-}
-
-void startRampTo(int targetUs) {
-  attachServosOnce();
-
-  if (targetUs < SERVO_MIN_US) targetUs = SERVO_MIN_US;
-  if (targetUs > SERVO_MAX_US) targetUs = SERVO_MAX_US;
-
-  rampTargetUs = targetUs;
-
-  // start from current position
-  rampPosUs = (float)currentPulseWidth;
-
-  rampActive = true;
-  lastRampUpdateMs = millis();
-}
-
-void updateRamp() {
-  if (!rampActive) return;
-
-  unsigned long now = millis();
-  unsigned long dtMs = now - lastRampUpdateMs;
-  if (dtMs == 0) return;
-  lastRampUpdateMs = now;
-
-  float dt = dtMs / 1000.0f;
-
-  float diff = (float)rampTargetUs - rampPosUs;
-  float step = autoRampSpeedUsPerSec * dt;
-
-  if (fabsf(diff) <= step) {
-    rampPosUs = (float)rampTargetUs;
-    applyServoPulseUS((int)roundf(rampPosUs));
-    rampActive = false;
-    return;
-  }
-
-  rampPosUs += (diff > 0.0f) ? step : -step;
-  applyServoPulseUS((int)roundf(rampPosUs));
 }
 
 // ======================================================
@@ -212,7 +264,7 @@ uint8_t fsrPins[NUM_SENSORS] = {
 };
 
 const char* fsrPinNames[NUM_SENSORS] = {
-  "PB0", "PA7", "PA6", "PA5", "PA4", "PA3", "PA2", "PA1", "PA0"
+  "Little", "LittlePalm", "Ring", "RingPalm", "Middle", "Index", "IndexPalm", "Thumb", "ThumbPalm"
 };
 
 void printFSRLive() {
@@ -236,10 +288,12 @@ void setup() {
 
   Serial.println("\n=== STM32 Black Pill: 5 Servo + 5 INA226 (PCA ch0..4) + 9 FSR Live ===");
 
+  // -------- I2C SETUP --------
   Wire.setSDA(PB9);
   Wire.setSCL(PB8);
   Wire.begin();
 
+  // -------- INIT INA226 SENSORS WITH CHECKS --------
   selectPCAChannel(0);
   if (!inaPresentOnCurrentBus()) { Serial.println("INA226 NOT FOUND on PCA channel 0. Halting."); while (1) {} }
   if (!ina226_0.init())          { Serial.println("INA226 init FAILED on PCA channel 0. Halting."); while (1) {} }
@@ -266,22 +320,33 @@ void setup() {
   selectPCAChannel(3); ina226_3.waitUntilConversionCompleted();
   selectPCAChannel(4); ina226_4.waitUntilConversionCompleted();
 
+  // -------- SERVO SETUP --------
   Serial.println("Servos DISABLED at boot (not attached). They will attach/move only after you send a command.");
   Serial.println("S0 PB13 (Pinky), S1 PB14 (Ring), S2 PB15 (Middle), S3 PA8 (Index), S4 PA11 (Thumb)");
 
+  // -------- FSR SETUP --------
   for (int i = 0; i < NUM_SENSORS; i++) {
     pinMode(fsrPins[i], INPUT_ANALOG);
   }
 
   Serial.println("\n📟 Serial Commands Reference (ONLY 0 and 1)");
-  Serial.println("1 → Ramp CLOSE (2400 → 500)  [10s]");
-  Serial.println("0 → Ramp OPEN  (500  → 2400) [10s]");
+  Serial.println("1 → Ramp CLOSE (2400 → 500)  [each finger uses its own sweep time]");
+  Serial.println("0 → Ramp OPEN  (500  → 2400) [each finger uses its own sweep time]");
   Serial.println("------------------------------");
-  Serial.print("FULL_SWEEP_TIME_SEC = ");
-  Serial.print(FULL_SWEEP_TIME_SEC);
-  Serial.print(" s, autoRampSpeedUsPerSec = ");
-  Serial.print(autoRampSpeedUsPerSec);
-  Serial.println(" us/s");
+
+  Serial.print("S0 sweep(s)="); Serial.print(SWEEP_TIME_S0_SEC);
+  Serial.print("  S1 sweep(s)="); Serial.print(SWEEP_TIME_S1_SEC);
+  Serial.print("  S2 sweep(s)="); Serial.print(SWEEP_TIME_S2_SEC);
+  Serial.print("  S3 sweep(s)="); Serial.print(SWEEP_TIME_S3_SEC);
+  Serial.print("  S4 sweep(s)="); Serial.println(SWEEP_TIME_S4_SEC);
+
+  Serial.print("Auto speeds (us/s): ");
+  Serial.print("S0="); Serial.print(autoSpeedUsPerSec[0]);
+  Serial.print(", S1="); Serial.print(autoSpeedUsPerSec[1]);
+  Serial.print(", S2="); Serial.print(autoSpeedUsPerSec[2]);
+  Serial.print(", S3="); Serial.print(autoSpeedUsPerSec[3]);
+  Serial.print(", S4="); Serial.println(autoSpeedUsPerSec[4]);
+
   Serial.println("Enter command:");
 }
 
@@ -299,13 +364,13 @@ void loop() {
 
     switch (cmd) {
       case '1':
-        // CLOSE: 2400 -> 500 (ramp to MIN)
-        startRampTo(SERVO_MIN_US);
+        // CLOSE: ramp to MIN (each finger own speed)
+        startRampAllTo(SERVO_MIN_US);
         break;
 
       case '0':
-        // OPEN: 500 -> 2400 (ramp to MAX)
-        startRampTo(SERVO_MAX_US);
+        // OPEN: ramp to MAX (each finger own speed)
+        startRampAllTo(SERVO_MAX_US);
         break;
 
       case '\n':
@@ -320,15 +385,19 @@ void loop() {
     Serial.println("Enter next command:");
   }
 
-  updateRamp();
+  // Update ramps (non-blocking)
+  updateRamps();
 
+  // Periodic current print (fixed format)
   if (millis() - lastCurrentPrint >= CURRENT_PRINT_PERIOD_MS) {
     lastCurrentPrint = millis();
     printINA226Data();
   }
 
+  // Periodic FSR live print
   if (millis() - lastFSRPrint >= FSR_PRINT_PERIOD_MS) {
     lastFSRPrint = millis();
     printFSRLive();
   }
 }
+
