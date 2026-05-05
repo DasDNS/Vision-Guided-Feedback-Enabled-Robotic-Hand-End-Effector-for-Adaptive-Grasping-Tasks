@@ -1,9 +1,0 @@
-<j
-Echo test: type something and press Enter.
-RX: 71
-RX: 72
-RX: 71
-RX: 85
-RX: 85
-RX: 73
-RX: 84
