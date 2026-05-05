@@ -1,229 +1,176 @@
-# Robotic End Effector Control (STM32 + PySide6 UI)
+# STM32 Hand Control (0/1 Ramp) + PySide6 Serial UI
 
 This project contains **two cooperating programs** that communicate over a **UART serial link (115200 baud)**:
 
-1. **STM32 firmware (Arduino framework)** for a robotic end-effector / hand:
-   - 5 servos (Pinky → Thumb)
-   - 5 INA226 current sensors via PCA9548A I2C mux (channels 0..4)
-   - 9 FSR sensors (analog inputs) on the palm
-   - A **finite state machine (FSM)** for grasping + disturbance recovery + tightening
-   - Continuous streaming of **FSR** and **current** telemetry
+1) **STM32 firmware (Arduino framework)**  
+   - 5 servos (same pulse to all servos)  
+   - 5 × INA226 current sensors behind a PCA9548A I2C mux (channels 0..4)  
+   - 9 analog FSR sensors (live readout)  
+   - Two commands only: **`1` = CLOSE ramp**, **`0` = OPEN ramp**  
+   - Continuous streaming of **current** + **FSR** text lines for logging/monitoring
 
-2. **Python desktop UI (PySide6)**:
-   - Serial connection (refresh/auto-detect/connect/disconnect)
-   - Pattern entry (5-bit finger selection) + Start/Reset buttons
-   - Filtering of MCU messages into **separate UI panels**
-   - Throttled RX handling (queue + timer) to avoid UI slowdown at high message rates
+2) **Python desktop UI (PySide6)**  
+   - Serial connect/disconnect with port refresh + auto-detect  
+   - Buttons for **Close (1)** and **Open (0)** that send **single bytes** (no line ending)  
+   - Serial-monitor style send box (configurable line ending)  
+   - Automatically **filters MCU output into separate panels**: FSR, Current, Status  
    - Debug log + Clear UI
 
 ---
 
-## 🧠 Overall Flow (End-to-End)
+## 🧠 End-to-End Flow
 
-1. **User selects fingers** to actuate by sending a **5-bit pattern**:
-   - Example: `11000` → Pinky + Ring enabled, others idle.
+1. Flash the STM32 firmware and connect the board over USB-UART at **115200 baud**.
+2. Run the Python UI on your PC.
+3. Click **Connect**.
+4. Use:
+   - **`1`** → ramps servos from **2400 → 500** (CLOSE) over **10 seconds**
+   - **`0`** → ramps servos from **500 → 2400** (OPEN) over **10 seconds**
+5. While running, the MCU continuously prints:
+   - Current readings (INA226) in a fixed format
+   - FSR live readings in a fixed format
+   - Other status messages (“Received: …”, “Servos attached…”, errors, etc.)
 
-2. User presses **Start Grasping** (sends `2`):
-   - MCU starts the FSM grasp sequence **only if** a pattern was received and the system is **IDLE**.
-
-3. During grasping, the MCU continuously streams:
-   - `FSR Live: ...`  (FSR telemetry)
-   - `millis,pulse,Little=... mA, Ring=... mA, ...` (current telemetry)
-   - `[STATE] <STATE_NAME>` updates when FSM changes state
-   - Other status/info messages
-
-4. User can press **Reset/Open** (sends `3`) at any time:
-   - MCU opens the hand, clears the pattern, returns to IDLE, and waits for a new pattern.
+The UI separates these into dedicated text areas.
 
 ---
 
 # 1) STM32 Firmware
 
-## ✅ Hardware Mapping
+## ✅ Hardware / Pin Mapping
 
-### Servos (5)
-| Index | Finger | Pin |
-|------:|--------|-----|
-| 0 | Pinky  | PB13 |
-| 1 | Ring   | PB14 |
-| 2 | Middle | PB15 |
-| 3 | Index  | PA8  |
-| 4 | Thumb  | PA11 |
+### Servos (all get the same commanded pulse width)
+| Channel | Finger | Pin |
+|--------:|--------|-----|
+| S0 | Pinky  | PB13 |
+| S1 | Ring   | PB14 |
+| S2 | Middle | PB15 |
+| S3 | Index  | PA8  |
+| S4 | Thumb  | PA11 |
 
-### I2C (INA226 + PCA9548A)
+### I2C Bus
 - SDA: **PB9**
 - SCL: **PB8**
 - PCA9548A address: **0x70**
-- INA226 address: **0x40** behind mux channels **0..4**
+- INA226 address: **0x40** (one per mux channel 0..4)
 
-### FSR Sensors (9 analog)
-Pins:
-`PB0, PA7, PA6, PA5, PA4, PA3, PA2, PA1, PA0`
+### FSR Sensors (9 analog inputs)
+Pins: `PB0, PA7, PA6, PA5, PA4, PA3, PA2, PA1, PA0`
 
-Names printed by firmware:
-- Little, LittlePalm, Ring, RingPalm, Middle, Index, IndexPalm, Thumb, ThumbPalm
+Names printed by firmware: `PB0, PA7, PA6, PA5, PA4, PA3, PA2, PA1, PA0`
 
 ---
 
-## 🌀 Servo Motion: Speed-based Ramp (Per Finger)
+## 🌀 Servo Motion (Speed-based Ramp, 10s Full Sweep)
 
-Servo motion uses a **time-based speed calculation**:
+Servo movement is **non-blocking** and based on elapsed time (`dt`):
 
-```cpp
-#define FULL_SWEEP_TIME_SEC 10.0f
-autoRampSpeedUsPerSec = (SERVO_MAX_US - SERVO_MIN_US) / FULL_SWEEP_TIME_SEC;
-```
+- Servo range: `SERVO_MIN_US = 500`, `SERVO_MAX_US = 2400`
+- Full travel: `1900 µs`
+- Desired sweep time:  
+  ```cpp
+  #define FULL_SWEEP_TIME_SEC 10.0f
+  ```
+- Auto speed:
+  ```cpp
+  autoRampSpeedUsPerSec = (SERVO_MAX_US - SERVO_MIN_US) / FULL_SWEEP_TIME_SEC;
+  ```
 
-- Ramping is updated continuously using `dt` (non-blocking).
-- Each finger has its own ramp target and ramp position.
-- Disabled fingers are forced to open (`SERVO_MAX_US`).
+### Commands (ONLY 2 commands)
+| Command | Action |
+|--------:|--------|
+| `1` | **CLOSE** ramp: 2400 → 500 |
+| `0` | **OPEN**  ramp: 500 → 2400 |
 
----
-
-## 🧩 FSM Grasp Control
-
-The grasp process is implemented as an FSM:
-
-- `IDLE`
-- `CLOSING_FAST`
-- `SETTLE`
-- `CLOSING_SLOW`
-- `HOLD`
-- `TIGHTEN`
-- `RECOVER`
-- `OPEN`
-
-FSM state changes are printed as:
-
-```
-[STATE] CLOSING_FAST
-```
-
-The UI detects this and displays it in the **FSM State** panel.
-
-### Sensor-based logic (high-level)
-- **Impact / disturbance** detection from current magnitude and current slope
-- **Contact** detection from FSR + current
-- **Secure grasp** detection from current band + stable slope
-- **Load increase** detection from current baseline shift (e.g., pouring water)
-- **Tighten** applies controlled small closing increments with a safety “budget”
+> Note: Servos are **not attached on boot**. They attach only when the first command is sent.
 
 ---
 
-## 📟 Firmware Serial Protocol (IMPORTANT)
-
-### Allowed Commands (only these)
-| Command | Meaning |
-|--------:|---------|
-| `00000` .. `11111` | 5-bit pattern (S0..S4) choosing which fingers are enabled |
-| `2` | Start grasp FSM (only when IDLE and pattern exists) |
-| `3` | Reset/Open immediately (go to OPEN then back to IDLE; clears pattern) |
-
-The firmware is **line-based** and expects commands terminated by LF/CRLF.
-It collects characters until newline then processes the command string.
-
-To prevent junk bytes (e.g., `�11111`), firmware keeps only `0/1/2/3` characters while building the command line.
-
----
-
-## 📊 Firmware Telemetry Output Formats
+## 📊 Firmware Telemetry Formats (Used by Python Filters)
 
 ### FSR output
 Starts with:
 ```
 FSR Live:
 ```
-
 Example:
 ```
-FSR Live: Little=0.00, LittlePalm=12.00, Ring=0.00, ...
+FSR Live: PB0=0.00, PA7=12.00, PA6=0.00, ...
 ```
 
-### Current output
-Starts with:
+### Current output (MUST remain exactly this style)
+The Python UI detects current lines using a strict regex that matches this exact format:
 ```
-millis,pulse,
+millis,pulse,S0=.. mA, S1=.. mA, S2=.. mA, S3=.. mA, S4=.. mA
 ```
-and includes `mA` readings.
-
 Example:
 ```
-12345,2400,Little=10.2 mA, Ring=9.8 mA, Middle=11.0 mA, Index=8.7 mA, Thumb=12.5 mA
+26780,2400,S0=5.25 mA, S1=5.32 mA, S2=4.90 mA, S3=5.25 mA, S4=5.30 mA
 ```
 
 ### Print rates
-- Current: `CURRENT_PRINT_PERIOD_MS = 200` (5 Hz)
-- FSR: `FSR_PRINT_PERIOD_MS = 200` (5 Hz)
+- Current: `CURRENT_PRINT_PERIOD_MS = 200` → **5 Hz**
+- FSR: `FSR_PRINT_PERIOD_MS = 200` → **5 Hz**
 
 ---
 
 # 2) Python PySide6 UI
 
-## ✅ UI Features
+## ✅ Features
 
-### Serial Connection
-- Refresh ports (`ttyUSB*` and `ttyACM*`)
-- Auto-detect STM32 port
+### Serial connection
+- Refresh ports (filters for `/dev/ttyUSB*` and `/dev/ttyACM*`)
+- Auto-detect (first matching port)
 - Connect / Disconnect
-- Status label
+- Connection status label
 
-### Controls
-- **Start Grasping** → sends command `2`
-- **Reset/Open** → sends command `3`
-- **Send box** → allows only:
-  - 5-bit patterns `00000..11111`
-  - `2`
-  - `3`
-- **Clear UI** button clears all panels
+### Control buttons
+- **Close** button sends a single byte: `1`
+- **Open** button sends a single byte: `0`
+- Uses “send single char (no line ending)” to match firmware behavior (it reads `Serial.read()`)
 
-### Live Panels
-- **Active Fingers** (decoded from the last 5-bit pattern)
-- **FSM State** (parsed from `[STATE] ...`)
-- **FSR Values** (lines starting with `FSR Live:`)
-- **Current Values** (lines matching current format)
-- **MCU Status / Other Messages** (everything else)
-- **Debug Log** (TX/RX + connection events)
+### Serial-monitor send box
+- Type a command manually
+- Choose line ending: **NONE / LF / CR / CRLF**
+- Warning: if you type multiple characters with NONE, the firmware will read them as multiple commands.
 
----
+### Filtered display panels
+The UI classifies each MCU line as:
 
-## 🧠 Message Filtering Logic
-
-The UI classifies each received MCU line into one of:
-- `fsr`    → starts with `FSR Live:`
-- `current`→ matches `CURRENT_RE`
-- `fsm`    → matches `[STATE] <STATE>`
+- `fsr` → line starts with **`FSR Live:`**
+- `current` → line matches strict current regex
 - `status` → everything else
 
-This allows sensor data to be shown in dedicated panels while keeping general logs readable.
+Panels:
+- **FSR Values**
+- **Current Values**
+- **Current State / Other Messages**
+- **Debug Log** (RX/TX/connection events)
+- **Clear UI** button clears all panels
 
 ---
 
-## 🧯 High-Rate Serial Safety (Why the UI won’t freeze)
+## 🧯 UI Performance Notes
 
-Because the MCU prints ~10 lines/sec (5 Hz current + 5 Hz FSR) **plus** FSM logs, the UI uses:
-
-- A **deque RX queue** (`maxlen=2000`)
-- A **QTimer flush** every 50 ms (20 fps)
-- Flushes up to 200 lines per tick
-- **Line limiting** per panel to cap memory growth
-
-This prevents the Python UI from lagging under continuous telemetry.
+The MCU prints about **10 lines/sec** continuously (FSR + current).
+To prevent the UI from becoming slow:
+- each panel uses a **max line limit** (default ~300–450 lines)
+- older lines are automatically removed
 
 ---
 
 # 🛠️ Requirements
 
 ## STM32 side
-- STM32 board (Black Pill or similar)
-- Arduino STM32 core / PlatformIO
+- STM32 (Black Pill or similar)
 - PCA9548A I2C mux
-- 5× INA226 current sensors
+- 5× INA226
 - 5 servos
 - 9 FSR sensors
+- Arduino STM32 core / PlatformIO
 
-## PC side
-Install Python dependencies:
-
+## PC side (Python)
+Install dependencies:
 ```bash
 pip install PySide6 pyserial
 ```
@@ -232,68 +179,55 @@ pip install PySide6 pyserial
 
 # ▶️ How to Run
 
-## 1) Flash firmware
-Upload the STM32 code via Arduino IDE or PlatformIO.
-
-Serial:
-- **115200 baud**
-- Commands must be terminated by newline (LF/CRLF)
+## 1) Flash the firmware
+Upload the `.ino` / Arduino sketch to your STM32.
 
 ## 2) Run the UI
 ```bash
-python3 control_ui.py
+python3 stm32_hand_ui.py
 ```
 
-## 3) Typical test sequence
-1. Connect in UI
-2. Enter pattern: `11000` (or any 5-bit selection)
-3. Press **Start Grasping** (2)
-4. Observe:
-   - FSR panel updating
-   - Current panel updating
-   - FSM state transitions in the FSM panel
-5. Press **Reset/Open** (3) anytime to return to IDLE
+## 3) Test sequence
+1. Connect in the UI
+2. Click **1 (Close)** → servo ramp to 500 µs over 10s
+3. Click **0 (Open)** → servo ramp to 2400 µs over 10s
+4. Watch:
+   - **FSR Live** panel updating
+   - **Current Values** panel updating
 
 ---
 
 # ⚠️ Troubleshooting
 
-### USB-TTL disconnects / “broke”
-Common causes:
-- Servo power noise / brownouts
-- Missing common ground
-- Too-high print rate (buffer overflow)
-- Weak USB port / cable
+## “USB TTL broke” / serial disconnects
+Typical causes:
+- Servo power brownouts/noise affecting the MCU or USB-UART
+- No common ground between servo PSU and STM32/USB-UART
+- Too much printing (buffer overflow) with weak adapters/cables
 
-Fixes:
+Suggested fixes:
 - Power servos from a **separate supply**
-- Common ground between STM32, sensors, servo PSU, and USB
-- Add bulk capacitance on servo rail (470–1000 µF)
-- Reduce print rate (increase print period)
-- Use a higher quality USB-UART adapter
+- Ensure **common ground** (STM32 GND ↔ servo PSU GND ↔ USB-UART GND)
+- Add bulk capacitor on servo rail (470–1000 µF)
+- Use a better USB-UART adapter/cable
+- Increase print periods (e.g., 500 ms) if needed
 
-### Commands ignored
-- Only `00000..11111`, `2`, `3` are allowed
-- UI blocks invalid inputs
+## Commands not working
+- Buttons send **single bytes** (correct).
+- If using the send box, choose **NONE** and send only `0` or `1` for the cleanest behavior.
 
 ---
 
-# 📁 Suggested Repository Layout
+# 📁 Suggested Repo Layout
 
 ```
 .
 ├── firmware/
-│   └── stm32_fsm_grasp.ino
+│   └── stm32_hand_ramp_01.ino
 ├── ui/
-│   └── control_ui.py
+│   └── stm32_hand_ui.py
 └── README.md
 ```
-
----
-
-# 👩‍💻 Credits / Title
-UI window title in code:
-**“Robotic End Effector Control UI by EGT/21/491 and EGT/21/546”**
 
 ---
 
