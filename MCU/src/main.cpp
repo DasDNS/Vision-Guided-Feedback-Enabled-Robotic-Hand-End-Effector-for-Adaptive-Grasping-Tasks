@@ -18,7 +18,7 @@
 #define SERVO3_PIN PA8   // Index  (INA channel 3)
 #define SERVO4_PIN PA11  // Thumb  (INA channel 4)
 
-#define SERVO_MIN_US 500
+#define SERVO_MIN_US 800 //Min = 500
 #define SERVO_MAX_US 2400
 
 #define FULL_SWEEP_TIME_SEC 8.0f
@@ -27,8 +27,8 @@
 #define FSR_PRINT_PERIOD_MS 200
 
 // Targets (requested)
-#define FAST_TARGET_US   1800
-#define SLOW_TARGET_US    1000
+#define FAST_TARGET_US   2000
+#define SLOW_TARGET_US    1400
 
 Servo servo0, servo1, servo2, servo3, servo4;
 
@@ -680,22 +680,21 @@ void loop() {
         break;
       }
 
-
       case STATE_CLOSING_FAST: {
-        // Move to 1800 @ normal speed (only once)
+        // Move to 2000 @ normal speed (only once)
         if (!fastCommanded) {
           // FAST multipliers
           speedMul[0] = 1.00f; // Pinky
-          speedMul[1] = 1.50f; // Ring
-          speedMul[2] = 0.50f; // Middle 
-          speedMul[3] = 0.50f; // Index
+          speedMul[1] = 4.00f; // Ring
+          speedMul[2] = 1.00f; // Middle 
+          speedMul[3] = 1.00f; // Index
           speedMul[4] = 1.00f; // Thumb
 
           startRampAllToUsingGlobalMul(FAST_TARGET_US, autoRampSpeedUsPerSec, true);
           fastCommanded = true;
         }
 
-        // When enabled fingers finish reaching 1800 -> go to slow phase
+        // When enabled fingers finish reaching 2000 -> go to slow phase
         if (!anyEnabledRampActive() && enabledReachedTargetUs(FAST_TARGET_US, 8)) {
           enterState(STATE_CLOSING_SLOW);
         }
@@ -703,13 +702,13 @@ void loop() {
       }
 
       case STATE_CLOSING_SLOW: {
-        // Move 1800 -> 1000 @ half speed (only once)
+        // Move 2000 -> 1400 @ half speed (only once)
         if (!slowCommanded) {
           // SLOW multipliers 
           speedMul[0] = 1.00f; // Pinky
-          speedMul[1] = 1.50f; // Ring
-          speedMul[2] = 0.50f; // Middle 
-          speedMul[3] = 0.50f; // Index
+          speedMul[1] = 8.00f; // Ring
+          speedMul[2] = 1.00f; // Middle 
+          speedMul[3] = 1.00f; // Index
           speedMul[4] = 1.00f; // Thumb
 
           startRampAllToUsingGlobalMul(SLOW_TARGET_US, autoRampSpeedUsPerSec * 0.50f, true);
@@ -743,14 +742,14 @@ void loop() {
         // Tighten = ramp enabled fingers toward 500 @ 30% speed (only once)
         if (!tightenCommanded) {
           speedMul[0] = 1.00f;
-          speedMul[1] = 1.00f;
+          speedMul[1] = 8.00f;
           speedMul[2] = 1.00f; 
           speedMul[3] = 1.00f;
           speedMul[4] = 1.00f;
 
           startRampAllToUsingGlobalMul(SERVO_MIN_US, autoRampSpeedUsPerSec * 0.30f, true);
           tightenCommanded = true;
-          Serial.println("[FSM] TIGHTEN started: ramp -> 500us @ 30% speed");
+          Serial.println("[FSM] TIGHTEN started: ramp -> 800us @ 30% speed");
         }
 
         // If huge FSR change happens during slow -> HOLD

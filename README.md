@@ -1,329 +1,256 @@
-# Robotic End Effector Control (STM32 + PySide6 UI)
+# Robotic End Effector Grasping Project (STM32 + PySide6 UI)
 
-This project contains:
+This repository contains:
 
-- **MCU firmware (STM32 / Arduino framework)** implementing a **finite-state-machine (FSM)** grasp controller
-- **Desktop UI (PySide6 + pyserial)** for selecting active fingers (5‑bit pattern), starting grasp, and resetting/opening
+- **Firmware (STM32 / Arduino C++)**
+  - 5 servo outputs (Pinky/Ring/Middle/Index/Thumb)
+  - 5 INA226 current sensors via PCA9548A I²C mux (channels 0..4)
+  - 9 FSR sensors (analog) on the palm
+  - A grasping **finite state machine (FSM)** controlled from serial commands
 
-The system is designed for a robotic hand/end-effector with:
-- **5 servo-driven fingers** (Pinky, Ring, Middle, Index, Thumb)
-- **5 INA226 current sensors** (one per finger) connected through a **PCA9548A I2C multiplexer**
-- **9 FSR sensors** on the palm/fingers (analog inputs)
+- **Desktop UI (Python / PySide6)**
+  - Serial connect + safe command sending (pattern / start / reset)
+  - Live display of **FSM state**, **active fingers**, **FSR**, and **current** logs
 
----
-
-## Repository layout (recommended)
-
-You can organize your repo like:
-
-```
-.
-├── mcu/
-│   └── main.ino              # STM32 firmware (Arduino framework)
-├── ui/
-│   └── control_ui.py         # PySide6 desktop UI
-└── README.md
-```
+> Generated on 2026-02-20.
 
 ---
 
-## Hardware overview
+## Hardware
 
-### Servos
-- Servo pins:
-  - Pinky:  `PB13`
-  - Ring:   `PB14`
-  - Middle: `PB15`
-  - Index:  `PA8`
-  - Thumb:  `PA11`
+### MCU
+- STM32 Black Pill (Arduino framework / PlatformIO recommended)
 
-Servo pulse limits (microseconds):
-- `SERVO_MIN_US = 500`
-- `SERVO_MAX_US = 2400`
+### Servos (5)
+| Finger | Servo Index | STM32 Pin |
+|---|---:|---|
+| Pinky | S0 | `PB13` |
+| Ring | S1 | `PB14` |
+| Middle | S2 | `PB15` |
+| Index | S3 | `PA8` |
+| Thumb | S4 | `PA11` |
 
-### Current sensing (INA226 + PCA9548A)
-- INA226 I2C address: `0x40`
+Servo pulse limits:
+- `SERVO_MIN_US = 500` (closed)
+- `SERVO_MAX_US = 2400` (open/spread)
+
+### Current sensing (5 × INA226)
+- INA226 address: `0x40`
 - PCA9548A address: `0x70`
-- STM32 I2C pins (do not change in firmware):
-  - SDA: `PB9`
-  - SCL: `PB8`
+- Mux channel mapping:
+  - ch0 → INA226 for Pinky
+  - ch1 → INA226 for Ring
+  - ch2 → INA226 for Middle
+  - ch3 → INA226 for Index
+  - ch4 → INA226 for Thumb
 
-Each finger current sensor is behind a separate PCA channel:
-- Channel 0 → Pinky INA226
-- Channel 1 → Ring INA226
-- Channel 2 → Middle INA226
-- Channel 3 → Index INA226
-- Channel 4 → Thumb INA226
+### FSR sensing (9)
+Analog inputs:
+- `PB0, PA7, PA6, PA5, PA4, PA3, PA2, PA1, PA0`
 
-### FSR sensors (9 analog channels)
-Pins:
-```
-PB0, PA7, PA6, PA5, PA4, PA3, PA2, PA1, PA0
-```
-
-Names (printed as):
-- `Little`, `LittlePalm`, `Ring`, `RingPalm`, `Middle`, `Index`, `IndexPalm`, `Thumb`, `ThumbPalm`
+Printed names in firmware output:
+- `Little, LittlePalm, Ring, RingPalm, Middle, Index, IndexPalm, Thumb, ThumbPalm`
 
 ---
 
-## Build & upload (MCU)
+## Serial commands (UI ↔ Firmware)
 
-Typical PlatformIO / Arduino STM32 workflow (example):
+Firmware accepts only these commands (line-based, LF newline):
 
-- Ensure board is configured (e.g., BlackPill F401CE / similar).
-- Build and upload with your normal toolchain.
+1) **Pattern**: `00000` .. `11111`  
+Enables fingers for grasping. Bit order is:
+`S0 S1 S2 S3 S4` = `Pinky Ring Middle Index Thumb`
 
-> The firmware relies on `INA226_WE` library and Servo/I2C.
+- `1` → finger enabled (allowed to move)
+- `0` → finger disabled (forced open/spread)
+
+2) **Start**: `2`  
+Starts grasping **only** if a valid pattern was stored and state is `IDLE`.
+
+3) **Reset/Open**: `3`  
+Works **in any state**. Immediately begins opening and returns to `IDLE`.
+
+Example:
+```text
+11100   (enable Pinky + Ring + Middle)
+2       (start grasp)
+3       (reset/open)
+```
 
 ---
 
-## Run the UI (Desktop)
+## Firmware grasping FSM
 
-### Dependencies
-Python 3.9+ recommended.
+### Key speed & target settings
+- Base speed uses a time-based ramp:
+  - `FULL_SWEEP_TIME_SEC = 8.0`
+  - `autoRampSpeedUsPerSec = (SERVO_MAX_US - SERVO_MIN_US) / FULL_SWEEP_TIME_SEC`
 
-Install:
+Two-step close targets:
+- `FAST_TARGET_US = 2000`
+- `SLOW_TARGET_US = 1400`
+
+### States
+- `IDLE`  
+  Hand is open/spread; waits for a 5-bit pattern, then `2` to start.
+
+- `RESETTING`  
+  Triggered by `3`. Ramps all fingers open at normal speed, then returns to `IDLE`.
+
+- `CLOSING_FAST`  
+  One-time command:
+  - enabled fingers ramp to **2000 µs** at normal speed
+  - per-finger speed multipliers (`speedMul[]`) are applied (e.g., Ring can be faster)
+
+- `CLOSING_SLOW`  
+  One-time command:
+  - enabled fingers ramp to **1400 µs** at **50%** base speed
+  - safety: if **huge FSR change** happens → `HOLD`
+  - safety: if **current becomes high during motion** → `HOLD`
+  - when complete → `TIGHTEN`
+
+- `TIGHTEN`  
+  One-time command:
+  - enabled fingers ramp toward **500 µs** at **30%** base speed
+  - safety: huge FSR change or high current can move to `HOLD`
+  - when 500 reached → `SETTLE`
+
+- `HOLD`  
+  No ramp updates (ramp flags stopped). PWM holds grasp.
+  - If contact disappears (FSR and current low for a short debounce) → return to `TIGHTEN`
+
+- `SETTLE`  
+  No motion; maintains position.
+
+---
+
+## Filtering + detection rules
+
+### Filters
+- Current low-pass: `ALPHA_I = 0.20`
+- FSR low-pass: `ALPHA_FSR = 0.20`
+
+### Huge FSR change (used during slow/ tighten in this firmware)
+- Each sensor has a max range estimate:
+  - `[300, 600, 300, 600, 300, 300, 600, 300, 600]`
+- Huge change trigger:
+  - `abs(fsrFilt[s] - fsrSlowBase[s]) / fsrMaxRange[s] > FSR_SLOW_HUGE_DELTA_FRAC`
+- Default:
+  - `FSR_SLOW_HUGE_DELTA_FRAC = 0.30`
+
+### Current high trigger
+- If any enabled finger current rises above:
+  - `I_TIGHTEN_HIGH_MA = 800 mA`
+then motion can stop and go to `HOLD`.
+
+### HOLD release trigger (debounced)
+If **all** FSRs are low and **all enabled currents** are low continuously for:
+- `HOLD_RELEASE_DEBOUNCE_MS = 150`
+
+Thresholds:
+- FSR: below `HOLD_RELEASE_FSR_FRAC = 0.20` of each sensor range
+- Current: below `HOLD_RELEASE_I_MA = 100 mA`
+
+Then FSM returns to `TIGHTEN`.
+
+---
+
+## Building & flashing (firmware)
+
+### PlatformIO (recommended)
+1. Create a PlatformIO project for your Black Pill board (example: `blackpill_f401ce`)
+2. Add required libraries:
+   - `INA226_WE`
+   - Built-in: `Wire`, `Servo`
+3. Upload:
 ```bash
+pio run -t upload
+```
+
+### Important notes
+- I²C pins are fixed:
+  - `SDA = PB9`
+  - `SCL = PB8`
+- Firmware halts if any INA226 init fails or device is missing.
+
+---
+
+## Running the Python UI
+
+### Requirements
+- Python 3.10+
+- Packages:
+  - `PySide6`
+  - `pyserial`
+
+### Setup (Linux)
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install PySide6 pyserial
 ```
 
-Run:
+### Run
+Save the UI as `ui.py` and run:
 ```bash
-python3 ui/control_ui.py
+python3 ui.py
+```
+
+### Serial permission (Linux)
+```bash
+sudo usermod -aG dialout $USER
+# log out and back in
 ```
 
 ---
 
-## Serial protocol (UI ↔ MCU)
+## UI usage
 
-The UI only sends **line-based commands** terminated by `\n`.
+1. **Connect**
+   - Refresh Ports → select device → Connect
+2. **Send a pattern**
+   - Type `00000..11111` → Send
+   - Active finger dots update (green=enabled, red=disabled)
+3. **Start**
+   - Press *Start Grasping* (sends `2`)
+4. **Reset/Open**
+   - Press *Reset/Open* (sends `3`) anytime
 
-Allowed commands:
-- **5-bit finger pattern**: `00000` to `11111`
-  - Bit order in firmware/UI: **[Pinky, Ring, Middle, Index, Thumb]**
-  - Example: `10101` → Pinky + Middle + Thumb enabled
-- **Start grasp**: `2`
-- **Reset / Open**: `3`  *(works in any state)*
-
-Firmware prints:
-- Current line (periodic):  
-  `millis,pulse,Little=... mA, Ring=... mA, ...`
-- FSR line (periodic):  
-  `millis,FSR Live: Little=..., LittlePalm=..., ...`
-- State transitions:  
-  `[STATE] IDLE` / `[STATE] CLOSING_FAST` / etc.
-- Other `[UI]` / `[FSM]` messages
+UI shows:
+- FSM state in large text (highlighted when it changes)
+- FSR lines
+- Current lines
+- Status + debug logs
 
 ---
 
-## Motion model (speed-based ramp)
+## Troubleshooting
 
-The firmware uses a **speed-based ramp** per finger:
+- **“INA226 NOT FOUND … Halting.”**
+  - Check PCA9548A address (0x70), INA226 address (0x40), wiring, power, and mux channels.
 
-- Full travel: `SERVO_MAX_US - SERVO_MIN_US` (1900 µs)
-- Desired full travel time: `FULL_SWEEP_TIME_SEC` (default 8.0 s)
-- Base speed:
-  ```
-  autoRampSpeedUsPerSec = 1900 / FULL_SWEEP_TIME_SEC
-  ```
+- **UI connects but no output**
+  - STM32 may reset on connect; wait ~2 seconds.
+  - Confirm baud rate is 115200.
 
-Each state can apply per-finger multipliers (`speedMul[]`) to compensate different mechanical behavior per finger.
-
----
-
-## Finite State Machine (FSM)
-
-### States
-- `STATE_IDLE`  
-  Open/spread position. Waiting for a valid 5-bit pattern and Start command.
-- `STATE_CLOSING_FAST`  
-  Enabled fingers ramp toward **FAST_TARGET_US (1800 µs)** at normal speed (with per-finger multipliers).
-- `STATE_CLOSING_SLOW`  
-  Enabled fingers ramp toward **SLOW_TARGET_US (1000 µs)** at **half speed** (with per-finger multipliers).
-- `STATE_TIGHTEN`  
-  Enabled fingers ramp toward **SERVO_MIN_US (500 µs)** at **30% speed** to tighten the grasp.
-- `STATE_HOLD`  
-  Stop all ramps; maintain current servo positions (grasp hold). Optional release→tighten logic can re-engage.
-- `STATE_SETTLE`  
-  Stop all ramps; do not move (final settle/no motion).
-- `STATE_RESETTING`  
-  Reset/open: ramp all fingers to `SERVO_MAX_US` at normal speed; then return to IDLE.
+- **Servo doesn’t move**
+  - Ensure servo power supply can deliver enough current.
+  - Ensure common ground between servo supply and STM32.
 
 ---
 
-## FSM transitions (all possibilities)
-
-### Global transition (works from ANY state)
-- **If command `3` received** → `STATE_RESETTING`
-
----
-
-### IDLE
-**Entry conditions**
-- Power-on enters IDLE (after opening to SERVO_MAX_US).
-- RESETTING completes → returns to IDLE.
-
-**Transitions**
-- Pattern received (`00000..11111`) → stored, still IDLE
-- Start command `2` (only if pattern exists) → `STATE_CLOSING_FAST`
+## Suggested repo layout
+```text
+project/
+  firmware/
+    main.cpp
+    platformio.ini
+  ui/
+    ui.py
+  README.md
+```
 
 ---
 
-### RESETTING
-**What happens**
-- Clears stored pattern, enables all fingers during opening
-- Starts a ramp to open/spread (`SERVO_MAX_US`)
-
-**Transition**
-- When all ramps complete (`!anyRampActive()`) → force exact SERVO_MAX_US → `STATE_IDLE`
-
----
-
-### CLOSING_FAST
-**What happens**
-- If not commanded yet: start ramp enabled fingers to `FAST_TARGET_US` at base speed  
-  (with per-finger multipliers, e.g., Ring faster, Middle/Index slower)
-
-**Transition**
-- When enabled fingers reached `FAST_TARGET_US` → `STATE_CLOSING_SLOW`
-
----
-
-### CLOSING_SLOW
-**What happens**
-- If not commanded yet: start ramp enabled fingers to `SLOW_TARGET_US` at **0.50× base speed**
-
-**Possible transitions**
-1) **Huge FSR change detected** (relative to baseline captured at entry)  
-   → `STATE_HOLD`  
-   Prints: `"[FSM] Huge FSR change detected in CLOSING_SLOW -> HOLD"`
-
-2) **High current during slow** (enabled finger current ≥ `I_TIGHTEN_HIGH_MA`, default 800 mA)  
-   → `STATE_HOLD`  
-   Prints: `"[FSM] Current high during CLOSING_SLOW -> HOLD"`
-
-3) **Slow ramp completes normally** (enabled fingers reach `SLOW_TARGET_US`)  
-   → `STATE_TIGHTEN`  
-   Prints: `"[FSM] CLOSING_SLOW complete -> TIGHTEN"`
-
----
-
-### TIGHTEN
-**What happens**
-- If not commanded yet: ramp enabled fingers toward `SERVO_MIN_US` at **0.30× base speed**
-
-**Possible transitions**
-1) **Huge FSR change detected**  
-   → `STATE_HOLD`
-
-2) **High current during tighten**  
-   → `STATE_HOLD`
-
-3) **Tighten completes** (enabled fingers reach `SERVO_MIN_US`)  
-   → `STATE_SETTLE`  
-   Prints: `"[FSM] Reached 500us -> SETTLE (no movement)"`
-
----
-
-### HOLD
-**What happens**
-- `stopAllRamps()` is called continuously
-- Servos remain at last commanded pulse widths (holding grasp)
-
-**Optional transition: HOLD → TIGHTEN (release / contact lost rule)**
-This project includes a *contact-lost re-tighten* condition:
-
-If BOTH are true for at least `HOLD_RELEASE_DEBOUNCE_MS`:
-- All FSR readings are below a fraction of each sensor’s configured max range:
-  - `fsrFilt[s] / fsrMaxRange[s] <= HOLD_RELEASE_FSR_FRAC`  
-  - Default: `HOLD_RELEASE_FSR_FRAC = 0.20` (20%)
-- All enabled finger currents are below:
-  - `iFilt[f] <= HOLD_RELEASE_I_MA`  
-  - Default: `HOLD_RELEASE_I_MA = 100 mA`
-
-Then:
-- `STATE_HOLD` → `STATE_TIGHTEN`
-- Prints: `"[FSM] HOLD: contact low (FSR<20% + I<100mA) -> TIGHTEN"`
-
-If the condition stops being true before debounce completes, the timer resets and HOLD continues.
-
-> Note: The provided implementation checks *all 9 FSR sensors* for the “low” condition.
-> If you want this rule to consider only specific sensors (e.g., palm sensors only), modify `fsrLowEnoughForRelease()`.
-
----
-
-### SETTLE
-**What happens**
-- No motion; all ramps stopped (`stopAllRamps()`)
-
-**Transitions**
-- Only global reset (`3`) → RESETTING  
-(Otherwise stays in SETTLE.)
-
----
-
-## Sensor processing
-
-### Filtering
-Low-pass filters are applied:
-- Current filter: `ALPHA_I = 0.20`
-- FSR filter: `ALPHA_FSR = 0.20`
-
-### Huge FSR change during slow/tighten
-At entry to `STATE_CLOSING_SLOW`, the firmware snapshots:
-- `fsrSlowBase[s] = fsrFilt[s]`
-
-Then at runtime:
-- `delta = |fsrFilt[s] - fsrSlowBase[s]|`
-- `frac = delta / fsrMaxRange[s]`
-- If any sensor `frac > FSR_SLOW_HUGE_DELTA_FRAC` (default 0.30) → huge change.
-
----
-
-## UI features (PySide6)
-
-- Auto-detects serial ports (filters `ttyUSB*` / `ttyACM*`)
-- Connects with `exclusive=True` (Linux) to avoid multiple programs opening same port
-- Displays:
-  - **Active finger pattern** as a dot/circle table
-  - **FSM state** prominently (large text + subtle background color)
-  - Separate panes for FSR / Current / Status / Debug log
-- Prevents accidental commands:
-  - Blocks anything other than **5-bit pattern**, `2`, or `3`
-  - Sanitizes NUL bytes and junk characters
-- Prevents “never-ending spam”:
-  - Read thread exits on disconnect or errors
-  - Error popups are rate-limited and deduplicated
-  - Log output is trimmed to a maximum number of lines
-
----
-
-## Safety notes & recommended limits
-
-- Always test with the hand unloaded first.
-- Verify `SERVO_MIN_US`/`SERVO_MAX_US` are safe for your mechanical limits.
-- Consider adding:
-  - A hard current cutoff (emergency open / stop)
-  - A max time in TIGHTEN (avoid driving into hard stop forever if sensors fail)
-  - A watchdog for I2C/INA226 failures (currently halts on I2C error)
-
----
-
-## Credits / Title
-
-UI window title in code:
-> "Robotic End Effector Control UI by EGT/21/491 and EGT/21/546"
-
----
-
-## Quick usage checklist
-
-1. Power MCU and connect USB serial.
-2. Start the UI.
-3. Select port → Connect.
-4. Send a 5-bit pattern (e.g., `11111`).
-5. Press **Start** (sends `2`).
-6. To stop and open at any time, press **Reset/Open** (sends `3`).
-
----
-
+## Credits
+UI title in code: **EGT/21/491 and EGT/21/546**.
