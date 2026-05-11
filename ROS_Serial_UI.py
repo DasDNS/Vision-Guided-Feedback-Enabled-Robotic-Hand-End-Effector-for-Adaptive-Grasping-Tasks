@@ -4,7 +4,6 @@ import time
 import threading
 import re
 from collections import deque
-from dataclasses import dataclass
 from typing import Optional
 from threading import Lock
 
@@ -31,6 +30,7 @@ from std_msgs.msg import String as RosString
 # ----------------------------
 ROS_TOPIC_REQUEST = "finger_pattern_request"   # UI -> vision laptop
 ROS_TOPIC_PATTERN = "finger_pattern"           # vision laptop -> UI
+ROS_TOPIC_ACK = "finger_pattern_ack"   # UI -> vision laptop (confirmation)
 
 PATTERN_RE = re.compile(r"^[01]{5}$")
 STATE_RE = re.compile(r".*\[STATE\]\s+([A-Z_]+)\s*$")
@@ -237,16 +237,17 @@ class RosPatternNode(Node):
         self._q_lock = q_lock
         self._sig_pattern_cb = sig_pattern_cb
         self._sig_log_cb = sig_log_cb
-        self._sig_status_cb = sig_status_cb  # ✅ NEW
+        self._sig_status_cb = sig_status_cb  
 
         self.req_pub = self.create_publisher(RosString, ROS_TOPIC_REQUEST, 10)
         self.sub = self.create_subscription(RosString, ROS_TOPIC_PATTERN, self._on_pattern, 10)
+        self.ack_pub = self.create_publisher(RosString, ROS_TOPIC_ACK, 10)
 
         self.timer = self.create_timer(0.05, self._flush_outbound)
 
         self._sig_log_cb(f"[ROS] Node started. pub={ROS_TOPIC_REQUEST}, sub={ROS_TOPIC_PATTERN}")
 
-        # ✅ NEW: status tracking + periodic reporting
+        # status tracking + periodic reporting
         self._last_pattern_time = 0.0  # seconds (monotonic time)
         self._status_timer = self.create_timer(0.5, self._publish_status)
 
@@ -259,16 +260,21 @@ class RosPatternNode(Node):
         if msg_to_send is not None:
             m = RosString()
             m.data = msg_to_send
-            self.req_pub.publish(m)
-            self._sig_log_cb(f"[ROS] Published request: {msg_to_send!r}")
+
+            if msg_to_send.startswith("ACK:"):
+                self.ack_pub.publish(m)
+                self._sig_log_cb(f"[ROS] Published ACK: {msg_to_send!r}")
+            else:
+                self.req_pub.publish(m)
+                self._sig_log_cb(f"[ROS] Published request: {msg_to_send!r}")
 
     def _on_pattern(self, msg: RosString):
         data = (msg.data or "").strip()
-        self._last_pattern_time = time.monotonic()  # ✅ NEW
+        self._last_pattern_time = time.monotonic() 
         self._sig_log_cb(f"[ROS] RX pattern topic: {data!r}")
         self._sig_pattern_cb(data)
 
-    # ✅ NEW: periodic status publishing
+    # NEW: periodic status publishing
     def _publish_status(self):
         pubs_on_pattern = 0
         subs_on_request = 0
@@ -293,11 +299,12 @@ class RosPatternNode(Node):
         self._sig_status_cb(status)
 
 
+
 class RosWorker(QObject):
     sig_log = Signal(str)
     sig_pattern = Signal(str)
     sig_ready = Signal(bool)
-    sig_status = Signal(dict)   # ✅ NEW
+    sig_status = Signal(dict)  
 
     def __init__(self):
         super().__init__()
@@ -362,6 +369,12 @@ class RosWorker(QObject):
         with self._q_lock:
             self._out_q.append("REQ")
 
+    def ack_pattern(self, pat: str):
+        # Send ack via outbound queue OR call node method safely
+        # Easiest: push an "ACK:" message into the same outbound queue and handle it in RosPatternNode
+        with self._q_lock:
+            self._out_q.append(f"ACK:{pat}")
+
 
 # ----------------------------
 # UI
@@ -375,17 +388,19 @@ class MainWindow(QWidget):
         self.ros = RosWorker()
         self.ros.start()
 
-        # ✅ NEW: ROS status state vars
+        # NEW: ROS status state vars
         self._ros_local_ok = False
         self._ros_status_dict = {"pubs_on_pattern": 0, "subs_on_request": 0, "last_pattern_age_s": None}
 
         self._latest_pattern: Optional[str] = None
         self._pattern_sent_to_mcu: bool = False
 
+        self._waiting_for_pattern = False
+
         self.setWindowTitle("Robotic End Effector Control UI (Serial + ROS2 Pattern)")
         self.setMinimumWidth(1050)
 
-        # ✅ SAFE FIX: queue *everything*, flush via ONE timer
+        # SAFE FIX: queue *everything*, flush via ONE timer
         self._rx_q = deque(maxlen=5000)
         self._log_q = deque(maxlen=5000)
 
@@ -489,7 +504,7 @@ class MainWindow(QWidget):
 
         self.active_fingers_widget = FingerTableWidget(["Little", "Ring", "Middle", "Index", "Thumb"])
 
-        # ✅ SAFE FIX: FSM state is QLabel (fast + reliable)
+        # SAFE FIX: FSM state is QLabel (fast + reliable)
         self.fsm_state_label = QLabel("Waiting for MCU state...")
         self.fsm_state_label.setAlignment(Qt.AlignCenter)
         self.fsm_state_label.setMinimumHeight(90)
@@ -508,7 +523,7 @@ class MainWindow(QWidget):
         self.fsr_box.setUndoRedoEnabled(False)
         self.fsr_box.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.fsr_box.setMinimumHeight(160)
-        self.fsr_box.setMaximumBlockCount(100)   # ✅ keep last 100 lines
+        self.fsr_box.setMaximumBlockCount(100)   # keep last 100 lines
         fsr_layout.addWidget(self.fsr_box)
         fsr_group.setLayout(fsr_layout)
         root.addWidget(fsr_group)
@@ -520,7 +535,7 @@ class MainWindow(QWidget):
         self.current_box.setUndoRedoEnabled(False)
         self.current_box.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.current_box.setMinimumHeight(160)
-        self.current_box.setMaximumBlockCount(100)  # ✅ keep last 100 lines
+        self.current_box.setMaximumBlockCount(100)  # keep last 100 lines
         cur_layout.addWidget(self.current_box)
         cur_group.setLayout(cur_layout)
         root.addWidget(cur_group)
@@ -572,7 +587,7 @@ class MainWindow(QWidget):
         self.serial_mgr.sig_disconnected.connect(self.on_serial_disconnected)
         self.serial_mgr.sig_error.connect(self.on_error)
 
-        # ✅ SAFE FIX: only enqueue in signal handlers
+        # SAFE FIX: only enqueue in signal handlers
         self.serial_mgr.sig_rx_line.connect(self._enqueue_rx_line)
         self.serial_mgr.sig_log_line.connect(self._enqueue_log_line)
 
@@ -580,7 +595,7 @@ class MainWindow(QWidget):
         self.btn_request_pattern.clicked.connect(self.request_pattern_ros)
         self.btn_send_pattern_mcu.clicked.connect(self.send_ros_pattern_to_mcu)
 
-        # ✅ SAFE FIX: ROS logs also enqueue
+        # SAFE FIX: ROS logs also enqueue
         self.ros.sig_log.connect(self._enqueue_log_line)
         self.ros.sig_ready.connect(self.on_ros_ready)
         self.ros.sig_pattern.connect(self.on_ros_pattern_received)
@@ -590,7 +605,7 @@ class MainWindow(QWidget):
         self.active_fingers_widget.set_pattern(None)
         self._set_state_display("Waiting for MCU state...", is_boot=True)
 
-        # ✅ ensure label updates from initial state
+        # ensure label updates from initial state
         self._update_ros_status_label()
 
     # Ensure ROS stops on close
@@ -608,26 +623,26 @@ class MainWindow(QWidget):
         box.setLayout(layout)
         return box
 
-    # ✅ SAFE FIX: enqueue helper
+    # SAFE FIX: enqueue helper
     def _enqueue_log_line(self, s: str):
         self._log_q.append(s)
 
     def _enqueue_rx_line(self, s: str):
         self._rx_q.append(s)
 
-    # ✅ UPDATED: local ROS ready means "node created + spinning"
+    # UPDATED: local ROS ready means "node created + spinning"
     def on_ros_ready(self, ok: bool):
         self._ros_local_ok = bool(ok)
         if not ok:
             self._enqueue_log_line("[ROS] Not ready. Did you source ROS 2 Jazzy before running this UI?")
         self._update_ros_status_label()
 
-    # ✅ NEW: periodic status handler
+    # periodic status handler
     def on_ros_status(self, d: dict):
         self._ros_status_dict = d or self._ros_status_dict
         self._update_ros_status_label()
 
-    # ✅ NEW: update label text + color based on peers + message age
+    # update label text + color based on peers + message age
     def _update_ros_status_label(self):
         if not self._ros_local_ok:
             self.ros_status.setText("ROS: not started / init failed")
@@ -669,16 +684,24 @@ class MainWindow(QWidget):
         self.ros_status.setStyleSheet(f"color: {color}; font-weight: 800;")
 
     def request_pattern_ros(self):
+        self._waiting_for_pattern = True
         self._pattern_sent_to_mcu = False
         self.btn_send_pattern_mcu.setEnabled(False)
         self.ros.request_pattern()
         self._enqueue_log_line("[UI] Requested pattern from vision system (ROS).")
 
     def on_ros_pattern_received(self, pat: str):
+
+        if not self._waiting_for_pattern:
+            self._enqueue_log_line(f"[UI] Ignored ROS pattern (not requested): {pat}")
+            return
+
         pat = (pat or "").strip()
         if not PATTERN_RE.match(pat):
             self._enqueue_log_line(f"[UI] BLOCKED ROS pattern (not 5-bit): {pat!r}")
             return
+        
+        self._waiting_for_pattern = False
 
         self._latest_pattern = pat
         self._pattern_sent_to_mcu = False
@@ -686,6 +709,9 @@ class MainWindow(QWidget):
 
         self.active_fingers_widget.set_pattern(pat)
         self._enqueue_log_line(f"[UI] ROS pattern received: {pat}")
+
+        self.ros.ack_pattern(pat)
+        self._enqueue_log_line(f"[UI] Sent ACK for pattern: {pat}")
 
     def send_ros_pattern_to_mcu(self):
         if self._latest_pattern is None:
@@ -709,6 +735,7 @@ class MainWindow(QWidget):
             "TIGHTEN": "#fff3e0",
             "HOLD": "#ede7f6",
             "SETTLE": "#eceff1",
+            "RECOVER": "#e3f2fd",
         }.get(st, "#f5f5f5")
 
     def _set_state_display(self, st: str, is_boot: bool = False):
@@ -740,7 +767,7 @@ class MainWindow(QWidget):
             f"font-size: 26px; font-weight: 800; }}"
         )
 
-    # ✅ SAFE FIX: single flush for RX + LOG, batched appends
+    # SAFE FIX: single flush for RX + LOG, batched appends
     def _flush_queues(self):
         pulled = []
         for _ in range(min(400, len(self._rx_q))):
