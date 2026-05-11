@@ -1,256 +1,259 @@
-# Robotic End Effector Grasping Project (STM32 + PySide6 UI)
+# Robotic End Effector Control System
 
-This repository contains:
+**STM32 + INA226 + FSR + ROS2 + PySide6 UI**
 
-- **Firmware (STM32 / Arduino C++)**
-  - 5 servo outputs (Pinky/Ring/Middle/Index/Thumb)
-  - 5 INA226 current sensors via PCA9548A I²C mux (channels 0..4)
-  - 9 FSR sensors (analog) on the palm
-  - A grasping **finite state machine (FSM)** controlled from serial commands
+------------------------------------------------------------------------
 
-- **Desktop UI (Python / PySide6)**
-  - Serial connect + safe command sending (pattern / start / reset)
-  - Live display of **FSM state**, **active fingers**, **FSR**, and **current** logs
+## 📌 Overview
 
-> Generated on 2026-02-20.
+This project implements a **robotic hand / end effector control system**
+with:
 
----
+-   5 Servo-driven fingers
+-   5 INA226 current sensors (via PCA9548A I2C multiplexer)
+-   9 FSR (Force Sensitive Resistor) sensors
+-   Finite State Machine (FSM) based grasp control
+-   ROS 2 (Jazzy) pattern request/response integration
+-   PySide6 desktop UI with live monitoring
 
-## Hardware
+The system supports:
 
-### MCU
-- STM32 Black Pill (Arduino framework / PlatformIO recommended)
+-   Vision-based finger pattern selection (via ROS2)
+-   Controlled multi-phase grasping
+-   Current + force-based event detection
+-   Safe reset from ANY state
+-   Real-time visualization in a Python UI
 
-### Servos (5)
-| Finger | Servo Index | STM32 Pin |
-|---|---:|---|
-| Pinky | S0 | `PB13` |
-| Ring | S1 | `PB14` |
-| Middle | S2 | `PB15` |
-| Index | S3 | `PA8` |
-| Thumb | S4 | `PA11` |
+------------------------------------------------------------------------
 
-Servo pulse limits:
-- `SERVO_MIN_US = 500` (closed)
-- `SERVO_MAX_US = 2400` (open/spread)
+# 🧠 System Architecture
 
-### Current sensing (5 × INA226)
-- INA226 address: `0x40`
-- PCA9548A address: `0x70`
-- Mux channel mapping:
-  - ch0 → INA226 for Pinky
-  - ch1 → INA226 for Ring
-  - ch2 → INA226 for Middle
-  - ch3 → INA226 for Index
-  - ch4 → INA226 for Thumb
+## Firmware (STM32)
 
-### FSR sensing (9)
-Analog inputs:
-- `PB0, PA7, PA6, PA5, PA4, PA3, PA2, PA1, PA0`
+The STM32 firmware handles:
 
-Printed names in firmware output:
-- `Little, LittlePalm, Ring, RingPalm, Middle, Index, IndexPalm, Thumb, ThumbPalm`
+-   Servo control (speed-based ramp, per finger)
+-   Current sensing using INA226
+-   FSR sensing with filtering + slope detection
+-   FSM-based grasp logic
+-   Serial command interface
 
----
+## Desktop UI (Python + PySide6)
 
-## Serial commands (UI ↔ Firmware)
+The UI provides:
 
-Firmware accepts only these commands (line-based, LF newline):
+-   Serial connection manager
+-   ROS 2 integration
+-   Pattern visualization
+-   FSM state display
+-   FSR live data window
+-   Current data window
+-   Debug + status log panels
 
-1) **Pattern**: `00000` .. `11111`  
-Enables fingers for grasping. Bit order is:
-`S0 S1 S2 S3 S4` = `Pinky Ring Middle Index Thumb`
+------------------------------------------------------------------------
 
-- `1` → finger enabled (allowed to move)
-- `0` → finger disabled (forced open/spread)
+# 🔧 Hardware Components
 
-2) **Start**: `2`  
-Starts grasping **only** if a valid pattern was stored and state is `IDLE`.
+  Component                    Quantity   Purpose
+  ---------------------------- ---------- -------------------------------
+  STM32 (BlackPill F401CE)     1          Main controller
+  MG996R (or similar) Servos   5          Finger actuation
+  INA226 current sensors       5          Per-servo current measurement
+  PCA9548A I2C multiplexer     1          Multi-INA I2C routing
+  FSR Sensors                  9          Contact detection
+  External 5--6V supply        1          Servo power
 
-3) **Reset/Open**: `3`  
-Works **in any state**. Immediately begins opening and returns to `IDLE`.
+------------------------------------------------------------------------
 
-Example:
-```text
-11100   (enable Pinky + Ring + Middle)
-2       (start grasp)
-3       (reset/open)
+# ⚙️ Firmware Details
+
+## Servo Control
+
+-   Range: `500µs – 2400µs`
+-   Full sweep time: `FULL_SWEEP_TIME_SEC = 8.0`
+-   Speed automatically computed:
+
+```{=html}
+<!-- -->
 ```
+    autoRampSpeedUsPerSec = (SERVO_MAX_US - SERVO_MIN_US) / FULL_SWEEP_TIME_SEC
 
----
+Each finger supports: - Independent enable/disable - Per-state speed
+multipliers - Smooth ramp using speed-based control
 
-## Firmware grasping FSM
+------------------------------------------------------------------------
 
-### Key speed & target settings
-- Base speed uses a time-based ramp:
-  - `FULL_SWEEP_TIME_SEC = 8.0`
-  - `autoRampSpeedUsPerSec = (SERVO_MAX_US - SERVO_MIN_US) / FULL_SWEEP_TIME_SEC`
+# 🧭 Finite State Machine (FSM)
 
-Two-step close targets:
-- `FAST_TARGET_US = 2000`
-- `SLOW_TARGET_US = 1400`
+States:
 
-### States
-- `IDLE`  
-  Hand is open/spread; waits for a 5-bit pattern, then `2` to start.
+-   `IDLE`
+-   `RESETTING`
+-   `CLOSING_FAST`
+-   `CLOSING_SLOW`
+-   `TIGHTEN`
+-   `HOLD`
+-   `SETTLE`
 
-- `RESETTING`  
-  Triggered by `3`. Ramps all fingers open at normal speed, then returns to `IDLE`.
+## Grasp Sequence
 
-- `CLOSING_FAST`  
-  One-time command:
-  - enabled fingers ramp to **2000 µs** at normal speed
-  - per-finger speed multipliers (`speedMul[]`) are applied (e.g., Ring can be faster)
+1.  **CLOSING_FAST**
+    -   Move enabled fingers to 2000µs
+    -   Normal speed
+2.  **CLOSING_SLOW**
+    -   Move to 1400µs
+    -   50% speed
+    -   Monitor for:
+        -   Huge FSR change → HOLD
+        -   High current → HOLD
+3.  **TIGHTEN**
+    -   Ramp to 500µs
+    -   30% speed
+    -   Stops at full close
+4.  **HOLD**
+    -   Maintain position
+    -   If contact disappears → TIGHTEN
+5.  **SETTLE**
+    -   Final state (no movement)
 
-- `CLOSING_SLOW`  
-  One-time command:
-  - enabled fingers ramp to **1400 µs** at **50%** base speed
-  - safety: if **huge FSR change** happens → `HOLD`
-  - safety: if **current becomes high during motion** → `HOLD`
-  - when complete → `TIGHTEN`
+------------------------------------------------------------------------
 
-- `TIGHTEN`  
-  One-time command:
-  - enabled fingers ramp toward **500 µs** at **30%** base speed
-  - safety: huge FSR change or high current can move to `HOLD`
-  - when 500 reached → `SETTLE`
+# 📊 Sensor Processing
 
-- `HOLD`  
-  No ramp updates (ramp flags stopped). PWM holds grasp.
-  - If contact disappears (FSR and current low for a short debounce) → return to `TIGHTEN`
+## Current Filtering
 
-- `SETTLE`  
-  No motion; maintains position.
+Low-pass filter:
 
----
+    iFilt = iPrev + α * (iRaw - iPrev)
 
-## Filtering + detection rules
+Slope detection enables event-based control.
 
-### Filters
-- Current low-pass: `ALPHA_I = 0.20`
-- FSR low-pass: `ALPHA_FSR = 0.20`
+## FSR Monitoring
 
-### Huge FSR change (used during slow/ tighten in this firmware)
-- Each sensor has a max range estimate:
-  - `[300, 600, 300, 600, 300, 300, 600, 300, 600]`
-- Huge change trigger:
-  - `abs(fsrFilt[s] - fsrSlowBase[s]) / fsrMaxRange[s] > FSR_SLOW_HUGE_DELTA_FRAC`
-- Default:
-  - `FSR_SLOW_HUGE_DELTA_FRAC = 0.30`
+Each FSR has: - Defined max range - Fraction-based huge-change detection
 
-### Current high trigger
-- If any enabled finger current rises above:
-  - `I_TIGHTEN_HIGH_MA = 800 mA`
-then motion can stop and go to `HOLD`.
+Threshold example:
 
-### HOLD release trigger (debounced)
-If **all** FSRs are low and **all enabled currents** are low continuously for:
-- `HOLD_RELEASE_DEBOUNCE_MS = 150`
+    FSR_SLOW_HUGE_DELTA_FRAC = 0.30
 
-Thresholds:
-- FSR: below `HOLD_RELEASE_FSR_FRAC = 0.20` of each sensor range
-- Current: below `HOLD_RELEASE_I_MA = 100 mA`
+------------------------------------------------------------------------
 
-Then FSM returns to `TIGHTEN`.
+# 💻 Serial Command Interface
 
----
+Allowed commands:
 
-## Building & flashing (firmware)
+  Command         Meaning
+  --------------- ----------------------------
+  `00000–11111`   Finger activation pattern
+  `2`             Start grasp
+  `3`             Reset (works in ANY state)
 
-### PlatformIO (recommended)
-1. Create a PlatformIO project for your Black Pill board (example: `blackpill_f401ce`)
-2. Add required libraries:
-   - `INA226_WE`
-   - Built-in: `Wire`, `Servo`
-3. Upload:
-```bash
-pio run -t upload
-```
+Example workflow:
 
-### Important notes
-- I²C pins are fixed:
-  - `SDA = PB9`
-  - `SCL = PB8`
-- Firmware halts if any INA226 init fails or device is missing.
+    11000
+    2
 
----
+------------------------------------------------------------------------
 
-## Running the Python UI
+# 🖥 Python UI Features
 
-### Requirements
-- Python 3.10+
-- Packages:
-  - `PySide6`
-  - `pyserial`
+## Connection Panel
 
-### Setup (Linux)
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install PySide6 pyserial
-```
+-   Auto-detect STM32
+-   Manual port selection
+-   Safe disconnect handling
 
-### Run
-Save the UI as `ui.py` and run:
-```bash
-python3 ui.py
-```
+## ROS2 Integration
 
-### Serial permission (Linux)
-```bash
-sudo usermod -aG dialout $USER
-# log out and back in
-```
+-   Topic: `finger_pattern_request`
+-   Topic: `finger_pattern`
+-   Request pattern from vision system
+-   Status indicator shows ROS connectivity
 
----
+## Data Panels
 
-## UI usage
+-   FSR Values (live)
+-   Current Values (live)
+-   MCU Status
+-   Debug Log
 
-1. **Connect**
-   - Refresh Ports → select device → Connect
-2. **Send a pattern**
-   - Type `00000..11111` → Send
-   - Active finger dots update (green=enabled, red=disabled)
-3. **Start**
-   - Press *Start Grasping* (sends `2`)
-4. **Reset/Open**
-   - Press *Reset/Open* (sends `3`) anytime
+## Safety Features
 
-UI shows:
-- FSM state in large text (highlighted when it changes)
-- FSR lines
-- Current lines
-- Status + debug logs
+-   Command sanitization
+-   Only allowed commands accepted
+-   Pattern must be sent before grasp
+-   Queue-based UI updates (prevents crash due to high data rate)
 
----
+------------------------------------------------------------------------
 
-## Troubleshooting
+# 🔄 Data Classification in UI
 
-- **“INA226 NOT FOUND … Halting.”**
-  - Check PCA9548A address (0x70), INA226 address (0x40), wiring, power, and mux channels.
+Incoming serial lines are classified as:
 
-- **UI connects but no output**
-  - STM32 may reset on connect; wait ~2 seconds.
-  - Confirm baud rate is 115200.
+-   FSM state → displayed in large state box
+-   `FSR Live:` → FSR panel
+-   `millis,pulse,current...` → Current panel
+-   Other → Status panel
 
-- **Servo doesn’t move**
-  - Ensure servo power supply can deliver enough current.
-  - Ensure common ground between servo supply and STM32.
+------------------------------------------------------------------------
 
----
+# 🚀 Running the Project
 
-## Suggested repo layout
-```text
-project/
-  firmware/
-    main.cpp
-    platformio.ini
-  ui/
-    ui.py
-  README.md
-```
+## 1️⃣ Flash STM32 Firmware
 
----
+Use PlatformIO or Arduino framework for STM32.
 
-## Credits
-UI title in code: **EGT/21/491 and EGT/21/546**.
+Ensure: - SDA = PB9 - SCL = PB8 - All INA226 detected via PCA9548A
+
+## 2️⃣ Install Python Dependencies
+
+    pip install PySide6 pyserial rclpy
+
+Source ROS 2 Jazzy before running:
+
+    source /opt/ros/jazzy/setup.bash
+
+## 3️⃣ Run UI
+
+    python3 main.py
+
+------------------------------------------------------------------------
+
+# 🛡 Safety Considerations
+
+-   Always power servos from external supply
+-   Common ground required
+-   Monitor current spikes
+-   Avoid excessive serial print rates
+-   Use UI queue batching to prevent UART overload
+
+------------------------------------------------------------------------
+
+# 🧪 Testing Workflow
+
+1.  Connect STM32
+2.  Request pattern via ROS
+3.  Send pattern to MCU
+4.  Press Start
+5.  Observe FSM transitions
+6.  Press Reset anytime if needed
+
+------------------------------------------------------------------------
+
+# 📈 Future Improvements
+
+-   Closed-loop torque control
+-   Adaptive grasp force tuning
+-   Data logging to file
+-   Real-time plotting
+-   ROS2 action server integration
+
+------------------------------------------------------------------------
+
+# 📄 License
+
+Educational / Research Use
+
+------------------------------------------------------------------------
+
+**Author:** Robotic End Effector Development Project
