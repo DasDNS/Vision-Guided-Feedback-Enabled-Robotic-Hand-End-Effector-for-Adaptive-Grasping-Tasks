@@ -247,13 +247,6 @@ Source ROS 2 Jazzy before running:
 -   Data logging to file
 -   Real-time plotting
 -   ROS2 action server integration
-
 ------------------------------------------------------------------------
 
-# 📄 License
-
-Educational / Research Use
-
-------------------------------------------------------------------------
-
-**Author:** Robotic End Effector Development Project
+**Author:** DasDNS
