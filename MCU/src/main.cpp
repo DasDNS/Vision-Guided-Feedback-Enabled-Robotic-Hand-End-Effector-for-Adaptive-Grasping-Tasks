@@ -18,7 +18,7 @@
 #define SERVO3_PIN PA8   // Index  (INA channel 3)
 #define SERVO4_PIN PA11  // Thumb  (INA channel 4)
 
-#define SERVO_MIN_US 700   // Min = 500 (you chose 700)
+#define SERVO_MIN_US 500   // Min = 500 (you chose 700)
 #define SERVO_MAX_US 2400
 
 #define FULL_SWEEP_TIME_SEC 12.0f
@@ -612,7 +612,7 @@ void handleCommandLine(const String& cmdIn) {
   }
 
   if (isPattern5(cmd)) {
-    // ✅ Only allow patterns when IDLE (boot/after reset)
+    // Only allow patterns when IDLE (boot/after reset)
     if (state != STATE_IDLE) {
       Serial.println("[UI] BUSY: Hand is not IDLE. Press '3' to reset before sending a new pattern.");
       return;
