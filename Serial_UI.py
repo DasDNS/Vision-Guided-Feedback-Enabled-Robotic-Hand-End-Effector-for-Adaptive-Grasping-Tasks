@@ -4,8 +4,6 @@ import time
 import threading
 import re
 from collections import deque
-from typing import Optional
-from threading import Lock
 
 from PySide6.QtCore import QObject, Signal, QTimer, Qt
 from PySide6.QtWidgets import (
@@ -17,29 +15,6 @@ from PySide6.QtWidgets import (
 
 import serial
 import serial.tools.list_ports
-
-# ----------------------------
-# ROS 2 (Jazzy) imports
-# ----------------------------
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import String as RosString
-
-# ----------------------------
-# ROS topic names (edit if needed)
-# ----------------------------
-ROS_TOPIC_REQUEST = "finger_pattern_request"   # UI -> vision laptop
-ROS_TOPIC_PATTERN = "finger_pattern"           # vision laptop -> UI
-ROS_TOPIC_ACK = "finger_pattern_ack"   # UI -> vision laptop (confirmation)
-
-PATTERN_RE = re.compile(r"^[01]{5}$")
-STATE_RE = re.compile(r".*\[STATE\]\s+([A-Z_]+)\s*$")
-FSR_RE = re.compile(r"^(?:\d+\s*,\s*)?FSR Live:\s*")
-CURRENT_RE = re.compile(r"^\d+\s*,\s*\d+\s*,.*mA.*$")
-
-ALLOWED_CMD_RE = re.compile(r"^(?:[01]{5}|2|3)$")
-
-FINGER_NAMES = ["Pinky", "Ring", "Middle", "Index", "Thumb"]
 
 
 # ----------------------------
@@ -55,6 +30,20 @@ def find_stm32_port():
     return ports[0] if ports else None
 
 
+# ----------------------------
+# MCU line classification (your firmware)
+# ----------------------------
+STATE_RE = re.compile(r".*\[STATE\]\s+([A-Z_]+)\s*$")
+FSR_RE = re.compile(r"^(?:\d+\s*,\s*)?FSR Live:\s*")
+CURRENT_RE = re.compile(r"^\d+\s*,\s*\d+\s*,.*mA.*$")
+
+PATTERN_RE = re.compile(r"^[01]{5}$")
+# Allow ANY 5-bit pattern 00000..11111 OR '2' OR '3'
+ALLOWED_CMD_RE = re.compile(r"^(?:[01]{5}|2|3)$")
+
+FINGER_NAMES = ["Pinky", "Ring", "Middle", "Index", "Thumb"]
+
+
 def classify_mcu_line(s: str) -> str:
     if not s:
         return "status"
@@ -68,9 +57,14 @@ def classify_mcu_line(s: str) -> str:
 
 
 # ----------------------------
-# Finger selection widget
+# Finger selection widget (borderless "table" with circles)
 # ----------------------------
 class FingerTableWidget(QWidget):
+    """
+    Row 1: finger names (Little/Ring/Middle/Index/Thumb)
+    Row 2: colored circles (green selected, red not selected)
+    Also shows Pattern: 10101 in a subtle caption.
+    """
     def __init__(self, finger_names):
         super().__init__()
         self.finger_names = finger_names
@@ -107,11 +101,13 @@ class FingerTableWidget(QWidget):
 
         root.addWidget(self.pattern_label)
         root.addLayout(grid)
+
         self.set_pattern(None)
 
-    def set_pattern(self, pat: Optional[str]):
+    def set_pattern(self, pat: str | None):
         if pat is None or not PATTERN_RE.match(pat):
             self.pattern_label.setText("Pattern: (none)")
+            # default: all "not selected" look but subtle
             for dot in self._dot_labels:
                 dot.setStyleSheet("color: #b0bec5; font-size: 22px;")
             return
@@ -125,12 +121,13 @@ class FingerTableWidget(QWidget):
 
 
 # ----------------------------
-# Serial manager
+# Serial manager (threaded reader, Qt signals only)
 # ----------------------------
 class SerialManager(QObject):
     sig_connected = Signal(str)
     sig_disconnected = Signal()
     sig_error = Signal(str)
+
     sig_rx_line = Signal(str)
     sig_log_line = Signal(str)
 
@@ -138,7 +135,7 @@ class SerialManager(QObject):
         super().__init__()
         self._ser = None
         self._stop = False
-        self._error_latched = False
+        self._error_latched = False  # prevents spam
 
     def is_connected(self) -> bool:
         return self._ser is not None and self._ser.is_open
@@ -148,8 +145,16 @@ class SerialManager(QObject):
             self.sig_log_line.emit("Serial already connected.")
             return
         try:
-            self._ser = serial.Serial(port, baud, timeout=0.2, exclusive=True)
+            self._ser = serial.Serial(
+                port,
+                baud,
+                timeout=0.2,
+                exclusive=True
+            )
+
+            # STM32 may reset on open
             time.sleep(2.0)
+
             try:
                 self._ser.reset_input_buffer()
             except Exception:
@@ -180,14 +185,16 @@ class SerialManager(QObject):
         self.sig_log_line.emit("Disconnected.")
 
     def write_line_lf(self, text: str):
-        """MCU is line-based: always LF \\n."""
+        """Always send a line terminated by LF (firmware is line-based)."""
         if not self.is_connected():
             self.sig_error.emit("Not connected to serial.")
             return
+
         try:
             payload = (text + "\n").encode("utf-8", errors="replace")
             self._ser.write(payload)
             self._ser.flush()
+
             shown = text.replace("\r", "\\r").replace("\n", "\\n")
             self.sig_log_line.emit(f"TX: '{shown}' ending=LF bytes={payload!r}")
         except Exception as e:
@@ -201,12 +208,15 @@ class SerialManager(QObject):
             try:
                 if not self._ser:
                     break
+
                 raw = self._ser.readline()
                 if not raw:
                     continue
+
                 s = raw.decode("utf-8", errors="replace").strip()
                 if not s:
                     continue
+
                 self.sig_rx_line.emit(s)
                 self.sig_log_line.emit(f"RX: {s}")
 
@@ -214,8 +224,10 @@ class SerialManager(QObject):
                 if not self._error_latched:
                     self._error_latched = True
                     self.sig_error.emit(f"Serial disconnected (device removed?): {e}")
+
                 self.disconnect_port()
                 break
+
             except Exception as e:
                 if self._stop:
                     break
@@ -227,156 +239,6 @@ class SerialManager(QObject):
 
 
 # ----------------------------
-# ROS worker (runs rclpy spin in background)
-# ----------------------------
-class RosPatternNode(Node):
-    def __init__(self, outbound_queue: deque, q_lock: Lock, sig_pattern_cb, sig_log_cb, sig_status_cb):
-        super().__init__("ui_pattern_client")
-
-        self._out_q = outbound_queue
-        self._q_lock = q_lock
-        self._sig_pattern_cb = sig_pattern_cb
-        self._sig_log_cb = sig_log_cb
-        self._sig_status_cb = sig_status_cb  
-
-        self.req_pub = self.create_publisher(RosString, ROS_TOPIC_REQUEST, 10)
-        self.sub = self.create_subscription(RosString, ROS_TOPIC_PATTERN, self._on_pattern, 10)
-        self.ack_pub = self.create_publisher(RosString, ROS_TOPIC_ACK, 10)
-
-        self.timer = self.create_timer(0.05, self._flush_outbound)
-
-        self._sig_log_cb(f"[ROS] Node started. pub={ROS_TOPIC_REQUEST}, sub={ROS_TOPIC_PATTERN}")
-
-        # status tracking + periodic reporting
-        self._last_pattern_time = 0.0  # seconds (monotonic time)
-        self._status_timer = self.create_timer(0.5, self._publish_status)
-
-    def _flush_outbound(self):
-        msg_to_send = None
-        with self._q_lock:
-            if self._out_q:
-                msg_to_send = self._out_q.popleft()
-
-        if msg_to_send is not None:
-            m = RosString()
-            m.data = msg_to_send
-
-            if msg_to_send.startswith("ACK:"):
-                self.ack_pub.publish(m)
-                self._sig_log_cb(f"[ROS] Published ACK: {msg_to_send!r}")
-            else:
-                self.req_pub.publish(m)
-                self._sig_log_cb(f"[ROS] Published request: {msg_to_send!r}")
-
-    def _on_pattern(self, msg: RosString):
-        data = (msg.data or "").strip()
-        self._last_pattern_time = time.monotonic() 
-        self._sig_log_cb(f"[ROS] RX pattern topic: {data!r}")
-        self._sig_pattern_cb(data)
-
-    # NEW: periodic status publishing
-    def _publish_status(self):
-        pubs_on_pattern = 0
-        subs_on_request = 0
-        try:
-            pubs_on_pattern = self.count_publishers(ROS_TOPIC_PATTERN)
-        except Exception:
-            pubs_on_pattern = -1
-
-        try:
-            subs_on_request = self.count_subscribers(ROS_TOPIC_REQUEST)
-        except Exception:
-            subs_on_request = -1
-
-        now = time.monotonic()
-        age = (now - self._last_pattern_time) if self._last_pattern_time > 0 else None
-
-        status = {
-            "pubs_on_pattern": pubs_on_pattern,
-            "subs_on_request": subs_on_request,
-            "last_pattern_age_s": age,
-        }
-        self._sig_status_cb(status)
-
-
-
-class RosWorker(QObject):
-    sig_log = Signal(str)
-    sig_pattern = Signal(str)
-    sig_ready = Signal(bool)
-    sig_status = Signal(dict)  
-
-    def __init__(self):
-        super().__init__()
-        self._thread = None
-        self._running = False
-
-        self._out_q = deque()
-        self._q_lock = Lock()
-
-        self._executor = None
-        self._node = None
-
-    def start(self):
-        if self._running:
-            return
-        self._running = True
-
-        def runner():
-            try:
-                rclpy.init(args=None)
-                self._executor = rclpy.executors.SingleThreadedExecutor()
-
-                self._node = RosPatternNode(
-                    outbound_queue=self._out_q,
-                    q_lock=self._q_lock,
-                    sig_pattern_cb=lambda s: self.sig_pattern.emit(s),
-                    sig_log_cb=lambda s: self.sig_log.emit(s),
-                    sig_status_cb=lambda d: self.sig_status.emit(d),  # ✅ NEW
-                )
-                self._executor.add_node(self._node)
-                self.sig_ready.emit(True)
-                self._executor.spin()
-            except Exception as e:
-                self.sig_log.emit(f"[ROS] ERROR: {e}")
-                self.sig_ready.emit(False)
-            finally:
-                try:
-                    if self._executor and self._node:
-                        self._executor.remove_node(self._node)
-                        self._node.destroy_node()
-                except Exception:
-                    pass
-                try:
-                    if rclpy.ok():
-                        rclpy.shutdown()
-                except Exception:
-                    pass
-                self._running = False
-
-        self._thread = threading.Thread(target=runner, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        try:
-            if self._executor:
-                self._executor.shutdown()
-        except Exception:
-            pass
-        self._running = False
-
-    def request_pattern(self):
-        with self._q_lock:
-            self._out_q.append("REQ")
-
-    def ack_pattern(self, pat: str):
-        # Send ack via outbound queue OR call node method safely
-        # Easiest: push an "ACK:" message into the same outbound queue and handle it in RosPatternNode
-        with self._q_lock:
-            self._out_q.append(f"ACK:{pat}")
-
-
-# ----------------------------
 # UI
 # ----------------------------
 class MainWindow(QWidget):
@@ -384,28 +246,15 @@ class MainWindow(QWidget):
         super().__init__()
         self.serial_mgr = SerialManager()
 
-        # ROS worker (background)
-        self.ros = RosWorker()
-        self.ros.start()
+        self.setWindowTitle("Robotic End Effector Control UI by EGT/21/491 and EGT/21/546")
+        self.setMinimumWidth(1000)
 
-        # NEW: ROS status state vars
-        self._ros_local_ok = False
-        self._ros_status_dict = {"pubs_on_pattern": 0, "subs_on_request": 0, "last_pattern_age_s": None}
-
-        self._latest_pattern: Optional[str] = None
-        self._pattern_sent_to_mcu: bool = False
-
-        self._waiting_for_pattern = False
-
-        self.setWindowTitle("Robotic End Effector Control UI (Serial + ROS2 Pattern)")
-        self.setMinimumWidth(1050)
-
-        # SAFE FIX: queue *everything*, flush via ONE timer
+        # ---- Queues (ALL UI updates happen only in timer flush) ----
         self._rx_q = deque(maxlen=5000)
         self._log_q = deque(maxlen=5000)
 
         self._flush_timer = QTimer(self)
-        self._flush_timer.setInterval(50)
+        self._flush_timer.setInterval(50)  # 20 fps
         self._flush_timer.timeout.connect(self._flush_queues)
         self._flush_timer.start()
 
@@ -427,7 +276,7 @@ class MainWindow(QWidget):
         root.addWidget(title)
 
         # ---------------- Connection ----------------
-        conn_group = QGroupBox("Connection (MCU Serial)")
+        conn_group = QGroupBox("Connection (Serial)")
         conn_layout = QHBoxLayout()
 
         self.port_combo = QComboBox()
@@ -450,29 +299,12 @@ class MainWindow(QWidget):
         conn_group.setLayout(conn_layout)
         root.addWidget(conn_group)
 
-        # ---------------- Pattern from ROS ----------------
-        ros_group = QGroupBox("Vision Pattern (ROS 2 Jazzy)")
-        ros_layout = QHBoxLayout()
-
-        self.btn_request_pattern = QPushButton("Request Pattern (ROS)")
-        self.btn_send_pattern_mcu = QPushButton("Send Pattern to MCU")
-        self.btn_send_pattern_mcu.setEnabled(False)
-
-        self.ros_status = QLabel("ROS: starting...")
-        self.ros_status.setObjectName("rosStatus")
-
-        ros_layout.addWidget(self.btn_request_pattern)
-        ros_layout.addWidget(self.btn_send_pattern_mcu)
-        ros_layout.addWidget(self.ros_status, stretch=1)
-        ros_group.setLayout(ros_layout)
-        root.addWidget(ros_group)
-
         # ---------------- Controls ----------------
-        ctrl_group = QGroupBox("Controls (MCU)")
+        ctrl_group = QGroupBox("Controls")
         ctrl_layout = QHBoxLayout()
 
-        self.btn_start = QPushButton("  Start Grasping  ")
-        self.btn_reset_open = QPushButton("  Reset/Open  ")
+        self.btn_start = QPushButton("  Start Grasping  ")      # sends "2"
+        self.btn_reset_open = QPushButton("  Reset/Open  ")     # sends "3"
         self.btn_clear = QPushButton("Clear UI")
 
         ctrl_layout.addWidget(self.btn_start)
@@ -483,12 +315,12 @@ class MainWindow(QWidget):
         ctrl_group.setLayout(ctrl_layout)
         root.addWidget(ctrl_group)
 
-        # ---------------- Optional manual send (still useful for debug) ----------------
-        tx_group = QGroupBox("Manual Send (Debug) — Only allowed: 5-bit pattern OR 2 OR 3")
+        # ---------------- Serial Monitor style send ----------------
+        tx_group = QGroupBox("Send (Only allowed: 5-bit pattern OR 2 OR 3)")
         tx_layout = QHBoxLayout()
 
         self.tx_input = QLineEdit()
-        self.tx_input.setPlaceholderText("Type 00000..11111, or 2, or 3 then Enter")
+        self.tx_input.setPlaceholderText("Type 00000..11111 (pattern) or 2 (Start) or 3 (Reset/Open), then press Enter")
         self.btn_send = QPushButton("Send")
 
         tx_layout.addWidget(QLabel("Command:"))
@@ -504,11 +336,11 @@ class MainWindow(QWidget):
 
         self.active_fingers_widget = FingerTableWidget(["Little", "Ring", "Middle", "Index", "Thumb"])
 
-        # SAFE FIX: FSM state is QLabel (fast + reliable)
+        # ✅ Use QLabel for FSM state (fast, never “stalls”, easy big centered text)
         self.fsm_state_label = QLabel("Waiting for MCU state...")
         self.fsm_state_label.setAlignment(Qt.AlignCenter)
-        self.fsm_state_label.setMinimumHeight(90)
         self.fsm_state_label.setObjectName("fsmStateLabel")
+        self.fsm_state_label.setMinimumHeight(90)
 
         info_layout.addWidget(self._wrap_box("Active Fingers", self.active_fingers_widget), stretch=1)
         info_layout.addWidget(self._wrap_box("FSM State", self.fsm_state_label), stretch=1)
@@ -516,50 +348,46 @@ class MainWindow(QWidget):
         root.addWidget(info_group)
 
         # ---------------- FSR / Current / Status / Debug ----------------
+        self.fsr_box = QPlainTextEdit()
+        self.current_box = QPlainTextEdit()
+        self.status_box = QPlainTextEdit()
+        self.log_box = QPlainTextEdit()
+
+        for w in (self.fsr_box, self.current_box, self.status_box, self.log_box):
+            w.setReadOnly(True)
+            w.setUndoRedoEnabled(False)
+            w.setLineWrapMode(QPlainTextEdit.NoWrap)
+
+        # ✅ Keep only recent lines; Qt trims automatically (no cursor hacks)
+        self.fsr_box.setMaximumBlockCount(100)
+        self.current_box.setMaximumBlockCount(100)
+        self.status_box.setMaximumBlockCount(150)
+        self.log_box.setMaximumBlockCount(200)
+
         fsr_group = QGroupBox("FSR Values (FSR Live: ...)")
         fsr_layout = QVBoxLayout()
-        self.fsr_box = QPlainTextEdit()
-        self.fsr_box.setReadOnly(True)
-        self.fsr_box.setUndoRedoEnabled(False)
-        self.fsr_box.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.fsr_box.setMinimumHeight(160)
-        self.fsr_box.setMaximumBlockCount(100)   # keep last 100 lines
         fsr_layout.addWidget(self.fsr_box)
         fsr_group.setLayout(fsr_layout)
         root.addWidget(fsr_group)
 
         cur_group = QGroupBox("Current Values (millis,pulse, ...)")
         cur_layout = QVBoxLayout()
-        self.current_box = QPlainTextEdit()
-        self.current_box.setReadOnly(True)
-        self.current_box.setUndoRedoEnabled(False)
-        self.current_box.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.current_box.setMinimumHeight(160)
-        self.current_box.setMaximumBlockCount(100)  # keep last 100 lines
         cur_layout.addWidget(self.current_box)
         cur_group.setLayout(cur_layout)
         root.addWidget(cur_group)
 
         status_group = QGroupBox("MCU Status / Other Messages")
         status_layout = QVBoxLayout()
-        self.status_box = QPlainTextEdit()
-        self.status_box.setReadOnly(True)
-        self.status_box.setUndoRedoEnabled(False)
-        self.status_box.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.status_box.setMinimumHeight(180)
-        self.status_box.setMaximumBlockCount(150)
         status_layout.addWidget(self.status_box)
         status_group.setLayout(status_layout)
         root.addWidget(status_group)
 
-        log_group = QGroupBox("Debug Log (Serial + ROS)")
+        log_group = QGroupBox("Debug Log")
         log_layout = QVBoxLayout()
-        self.log_box = QPlainTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setUndoRedoEnabled(False)
-        self.log_box.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.log_box.setMinimumHeight(160)
-        self.log_box.setMaximumBlockCount(200)
         log_layout.addWidget(self.log_box)
         log_group.setLayout(log_layout)
         root.addWidget(log_group)
@@ -570,13 +398,13 @@ class MainWindow(QWidget):
 
         self.apply_theme()
 
-        # ---------------- signals (serial) ----------------
+        # ---------------- signals ----------------
         self.btn_refresh_ports.clicked.connect(self.refresh_ports)
         self.btn_auto.clicked.connect(self.auto_detect_port)
         self.btn_connect.clicked.connect(self.connect_serial)
         self.btn_disconnect.clicked.connect(self.disconnect_serial)
 
-        self.btn_start.clicked.connect(self.start_grasp_guarded)
+        self.btn_start.clicked.connect(lambda: self._send_allowed("2"))
         self.btn_reset_open.clicked.connect(lambda: self._send_allowed("3"))
         self.btn_clear.clicked.connect(self.clear_ui)
 
@@ -587,34 +415,13 @@ class MainWindow(QWidget):
         self.serial_mgr.sig_disconnected.connect(self.on_serial_disconnected)
         self.serial_mgr.sig_error.connect(self.on_error)
 
-        # SAFE FIX: only enqueue in signal handlers
+        # ✅ Only enqueue in signal handlers. Actual UI updates happen in _flush_queues()
         self.serial_mgr.sig_rx_line.connect(self._enqueue_rx_line)
         self.serial_mgr.sig_log_line.connect(self._enqueue_log_line)
-
-        # ---------------- signals (ROS) ----------------
-        self.btn_request_pattern.clicked.connect(self.request_pattern_ros)
-        self.btn_send_pattern_mcu.clicked.connect(self.send_ros_pattern_to_mcu)
-
-        # SAFE FIX: ROS logs also enqueue
-        self.ros.sig_log.connect(self._enqueue_log_line)
-        self.ros.sig_ready.connect(self.on_ros_ready)
-        self.ros.sig_pattern.connect(self.on_ros_pattern_received)
-        self.ros.sig_status.connect(self.on_ros_status)  # ✅ NEW
 
         self.refresh_ports()
         self.active_fingers_widget.set_pattern(None)
         self._set_state_display("Waiting for MCU state...", is_boot=True)
-
-        # ensure label updates from initial state
-        self._update_ros_status_label()
-
-    # Ensure ROS stops on close
-    def closeEvent(self, event):
-        try:
-            self.ros.stop()
-        except Exception:
-            pass
-        super().closeEvent(event)
 
     def _wrap_box(self, title: str, widget: QWidget) -> QWidget:
         box = QGroupBox(title)
@@ -622,107 +429,6 @@ class MainWindow(QWidget):
         layout.addWidget(widget)
         box.setLayout(layout)
         return box
-
-    # SAFE FIX: enqueue helper
-    def _enqueue_log_line(self, s: str):
-        self._log_q.append(s)
-
-    def _enqueue_rx_line(self, s: str):
-        self._rx_q.append(s)
-
-    # UPDATED: local ROS ready means "node created + spinning"
-    def on_ros_ready(self, ok: bool):
-        self._ros_local_ok = bool(ok)
-        if not ok:
-            self._enqueue_log_line("[ROS] Not ready. Did you source ROS 2 Jazzy before running this UI?")
-        self._update_ros_status_label()
-
-    # periodic status handler
-    def on_ros_status(self, d: dict):
-        self._ros_status_dict = d or self._ros_status_dict
-        self._update_ros_status_label()
-
-    # update label text + color based on peers + message age
-    def _update_ros_status_label(self):
-        if not self._ros_local_ok:
-            self.ros_status.setText("ROS: not started / init failed")
-            self.ros_status.setStyleSheet("color: #c62828; font-weight: 800;")
-            self.btn_request_pattern.setEnabled(False)
-            return
-
-        pubs = self._ros_status_dict.get("pubs_on_pattern", 0)
-        subs = self._ros_status_dict.get("subs_on_request", 0)
-        age = self._ros_status_dict.get("last_pattern_age_s", None)
-
-        have_remote_pattern_pub = (pubs is not None and pubs >= 1)
-        have_remote_request_sub = (subs is not None and subs >= 1)
-
-        if have_remote_pattern_pub and have_remote_request_sub:
-            if age is None:
-                msg = "ROS: connected (no pattern received yet)"
-            else:
-                msg = f"ROS: connected (last pattern {age:.1f}s ago)"
-            color = "#2e7d32"
-            self.btn_request_pattern.setEnabled(True)
-
-        elif have_remote_request_sub and not have_remote_pattern_pub:
-            msg = "ROS: request link OK, but no pattern publisher found"
-            color = "#f57c00"
-            self.btn_request_pattern.setEnabled(True)
-
-        elif have_remote_pattern_pub and not have_remote_request_sub:
-            msg = "ROS: pattern publisher found, but no request subscriber found"
-            color = "#f57c00"
-            self.btn_request_pattern.setEnabled(True)
-
-        else:
-            msg = "ROS: local OK, but no remote peer detected (check ROS_DOMAIN_ID / network / bringup)"
-            color = "#c62828"
-            self.btn_request_pattern.setEnabled(True)
-
-        self.ros_status.setText(msg)
-        self.ros_status.setStyleSheet(f"color: {color}; font-weight: 800;")
-
-    def request_pattern_ros(self):
-        self._waiting_for_pattern = True
-        self._pattern_sent_to_mcu = False
-        self.btn_send_pattern_mcu.setEnabled(False)
-        self.ros.request_pattern()
-        self._enqueue_log_line("[UI] Requested pattern from vision system (ROS).")
-
-    def on_ros_pattern_received(self, pat: str):
-
-        if not self._waiting_for_pattern:
-            self._enqueue_log_line(f"[UI] Ignored ROS pattern (not requested): {pat}")
-            return
-
-        pat = (pat or "").strip()
-        if not PATTERN_RE.match(pat):
-            self._enqueue_log_line(f"[UI] BLOCKED ROS pattern (not 5-bit): {pat!r}")
-            return
-        
-        self._waiting_for_pattern = False
-
-        self._latest_pattern = pat
-        self._pattern_sent_to_mcu = False
-        self.btn_send_pattern_mcu.setEnabled(True)
-
-        self.active_fingers_widget.set_pattern(pat)
-        self._enqueue_log_line(f"[UI] ROS pattern received: {pat}")
-
-        self.ros.ack_pattern(pat)
-        self._enqueue_log_line(f"[UI] Sent ACK for pattern: {pat}")
-
-    def send_ros_pattern_to_mcu(self):
-        if self._latest_pattern is None:
-            QMessageBox.warning(self, "No pattern", "No ROS pattern received yet.")
-            return
-        if not self._ensure_connected():
-            return
-
-        self.serial_mgr.write_line_lf(self._latest_pattern)
-        self._pattern_sent_to_mcu = True
-        self._enqueue_log_line(f"[UI] Sent pattern to MCU: {self._latest_pattern}")
 
     # ---- State display helpers ----
     def _state_color(self, st: str) -> str:
@@ -735,44 +441,51 @@ class MainWindow(QWidget):
             "TIGHTEN": "#fff3e0",
             "HOLD": "#ede7f6",
             "SETTLE": "#eceff1",
-            "RECOVER": "#e3f2fd",
+            "RECOVER": "#e3f2fd"
         }.get(st, "#f5f5f5")
 
     def _set_state_display(self, st: str, is_boot: bool = False):
         safe = (st or "").strip()
-        bg = self._state_color(safe)
-
-        # update text
         self.fsm_state_label.setText(safe if safe else "—")
 
-        # flash on change
+        bg = self._state_color(safe)
+        # Gentle "flash" on change (thicker border briefly)
         if not is_boot and safe and safe != self._last_state:
             self._last_state = safe
             self.fsm_state_label.setStyleSheet(
-                f"QLabel {{ background: {bg}; border: 2px solid #90a4ae; border-radius: 10px; padding: 8px; "
-                f"font-size: 26px; font-weight: 800; }}"
+                f"QLabel {{ background: {bg}; border: 2px solid #90a4ae; border-radius: 10px; "
+                f"padding: 8px; font-size: 26px; font-weight: 800; }}"
             )
             self._state_flash_timer.start(350)
         else:
             self.fsm_state_label.setStyleSheet(
-                f"QLabel {{ background: {bg}; border: 1px solid #cfd8dc; border-radius: 10px; padding: 8px; "
-                f"font-size: 26px; font-weight: 800; }}"
+                f"QLabel {{ background: {bg}; border: 1px solid #cfd8dc; border-radius: 10px; "
+                f"padding: 8px; font-size: 26px; font-weight: 800; }}"
             )
 
     def _end_state_flash(self):
         current = self._last_state or ""
         bg = self._state_color(current)
         self.fsm_state_label.setStyleSheet(
-            f"QLabel {{ background: {bg}; border: 1px solid #cfd8dc; border-radius: 10px; padding: 8px; "
-            f"font-size: 26px; font-weight: 800; }}"
+            f"QLabel {{ background: {bg}; border: 1px solid #cfd8dc; border-radius: 10px; "
+            f"padding: 8px; font-size: 26px; font-weight: 800; }}"
         )
 
-    # SAFE FIX: single flush for RX + LOG, batched appends
+    # ---- Queueing (signals) ----
+    def _enqueue_rx_line(self, s: str):
+        self._rx_q.append(s)
+
+    def _enqueue_log_line(self, s: str):
+        self._log_q.append(s)
+
+    # ---- Flush (ONLY place where we touch text widgets) ----
     def _flush_queues(self):
+        # Pull some RX
         pulled = []
         for _ in range(min(400, len(self._rx_q))):
             pulled.append(self._rx_q.popleft())
 
+        # Pull some LOG
         log_pulled = []
         for _ in range(min(400, len(self._log_q))):
             log_pulled.append(self._log_q.popleft())
@@ -787,6 +500,7 @@ class MainWindow(QWidget):
 
         for s in pulled:
             kind = classify_mcu_line(s)
+
             if kind == "fsr":
                 fsr_lines.append(s)
             elif kind == "current":
@@ -799,6 +513,7 @@ class MainWindow(QWidget):
             else:
                 status_lines.append(s)
 
+        # Append ONCE per box (fast)
         if fsr_lines:
             self.fsr_box.appendPlainText("\n".join(fsr_lines))
         if cur_lines:
@@ -815,13 +530,11 @@ class MainWindow(QWidget):
     def clear_ui(self):
         self.active_fingers_widget.set_pattern(None)
         self._set_state_display("Waiting for MCU state...", is_boot=True)
+
         self.fsr_box.clear()
         self.current_box.clear()
         self.status_box.clear()
         self.log_box.clear()
-        self._latest_pattern = None
-        self._pattern_sent_to_mcu = False
-        self.btn_send_pattern_mcu.setEnabled(False)
 
     def refresh_ports(self):
         self.port_combo.clear()
@@ -861,9 +574,7 @@ class MainWindow(QWidget):
         self.port_status.setText(f"Status: Connected to {port}")
         self.btn_connect.setEnabled(False)
         self.btn_disconnect.setEnabled(True)
-        self._enqueue_log_line(
-            "Connected. Workflow: Request Pattern (ROS) -> Send Pattern to MCU -> Start (2). Reset/Open is (3)."
-        )
+        self._enqueue_log_line("Connected. Send pattern (00000..11111) then press Start (2). Reset/Open is (3).")
 
     def on_serial_disconnected(self):
         self.port_status.setText("Status: Not connected")
@@ -877,27 +588,41 @@ class MainWindow(QWidget):
         return True
 
     def _sanitize_cmd(self, raw: str) -> str:
+        """
+        Remove NUL bytes and other junk that can appear as ^@ on the MCU.
+        Keep only 0/1/2/3 characters (since those are the only valid commands here).
+        """
         if raw is None:
             return ""
         raw = raw.replace("\x00", "").strip()
         return "".join(ch for ch in raw if ch in "0123")
 
     def _send_allowed(self, text: str):
+        """Send only if it is a 5-bit pattern (00000..11111) or '2' or '3'."""
         if not self._ensure_connected():
             return
 
         cleaned = self._sanitize_cmd(text)
+
         if cleaned != text.strip():
             self._enqueue_log_line(f"[UI] Cleaned input: {text!r} -> {cleaned!r}")
 
         if not ALLOWED_CMD_RE.match(cleaned):
-            self._enqueue_log_line(f"[UI] BLOCKED: Only allowed: 5-bit pattern OR '2' OR '3'. Got: {cleaned!r}")
-            QMessageBox.warning(self, "Blocked", "Only allowed: 00000..11111, or 2, or 3.")
+            self._enqueue_log_line(
+                f"[UI] BLOCKED: Only allowed commands are: 5-bit pattern (00000..11111) OR '2' OR '3'. Got: {cleaned!r}"
+            )
+            QMessageBox.warning(
+                self,
+                "Blocked",
+                "Only allowed: 00000..11111 (5-bit pattern), or 2 (Start), or 3 (Reset/Open)."
+            )
             return
 
+        # Update finger selection widget if pattern
         if PATTERN_RE.match(cleaned):
             self.active_fingers_widget.set_pattern(cleaned)
 
+        # If Reset/Open, clear finger selection immediately
         if cleaned == "3":
             self.active_fingers_widget.set_pattern(None)
 
@@ -910,21 +635,10 @@ class MainWindow(QWidget):
         self._send_allowed(raw)
         self.tx_input.clear()
 
-    def start_grasp_guarded(self):
-        if not self._ensure_connected():
-            return
-        if not self._pattern_sent_to_mcu:
-            QMessageBox.warning(
-                self,
-                "Pattern not sent",
-                "You must Send Pattern to MCU before starting grasp.\n\nWorkflow:\n1) Request Pattern (ROS)\n2) Send Pattern to MCU\n3) Start Grasping"
-            )
-            return
-        self._send_allowed("2")
-
     def on_error(self, msg: str):
         self._enqueue_log_line(f"ERROR: {msg}")
 
+        # If we are already disconnected (common after cable yank), avoid popup spam.
         if not self.serial_mgr.is_connected():
             return
 
@@ -933,6 +647,7 @@ class MainWindow(QWidget):
             self._last_err_popup_t = 0.0
             self._last_err_popup_msg = ""
 
+        # Deduplicate + rate-limit
         if msg == self._last_err_popup_msg and (now - self._last_err_popup_t) < 3.0:
             return
         if (now - self._last_err_popup_t) < 1.2:
@@ -940,6 +655,7 @@ class MainWindow(QWidget):
 
         self._last_err_popup_t = now
         self._last_err_popup_msg = msg
+
         QMessageBox.critical(self, "Error", msg)
 
     def apply_theme(self):
@@ -956,6 +672,8 @@ class MainWindow(QWidget):
         QPushButton:pressed { background-color: #0d47a1; }
         QPushButton:disabled { background-color: #90a4ae; color: #f5f5f5; }
         #portStatus { color: #2e7d32; font-weight: 700; }
+
+        /* Finger widget subtle typography */
         QLabel#fingerName { font-weight: 700; color: #263238; }
         QLabel#patternCaption { color: #607d8b; font-weight: 700; }
         """)

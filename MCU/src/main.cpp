@@ -18,17 +18,18 @@
 #define SERVO3_PIN PA8   // Index  (INA channel 3)
 #define SERVO4_PIN PA11  // Thumb  (INA channel 4)
 
-#define SERVO_MIN_US 800 //Min = 500
+#define SERVO_MIN_US 700   // Min = 500 (you chose 700)
 #define SERVO_MAX_US 2400
 
-#define FULL_SWEEP_TIME_SEC 8.0f
+#define FULL_SWEEP_TIME_SEC 12.0f
 
 #define CURRENT_PRINT_PERIOD_MS 200
 #define FSR_PRINT_PERIOD_MS 200
 
 // Targets (requested)
-#define FAST_TARGET_US   2000
-#define SLOW_TARGET_US    1400
+#define FAST_TARGET_US      1800
+#define SLOW_TARGET_US      1000
+#define RECOVER_SPREAD_US   900
 
 Servo servo0, servo1, servo2, servo3, servo4;
 
@@ -82,7 +83,8 @@ enum HandState {
   STATE_TIGHTEN,
   STATE_HOLD,
   STATE_SETTLE,
-  STATE_RESETTING  
+  STATE_RECOVER,
+  STATE_RESETTING
 };
 
 HandState state = STATE_IDLE;
@@ -96,7 +98,7 @@ bool fingerEnabled[NUM_SERVOS] = { false, false, false, false, false };
 
 // Global per-finger speed multipliers (can be changed per-state)
 // Order: 0=Pinky, 1=Ring, 2=Middle, 3=Index, 4=Thumb
-float speedMul[NUM_SERVOS] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+float speedMul[NUM_SERVOS] = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
 
 bool hasPattern = false;
 String lastPattern = "00000";
@@ -104,24 +106,25 @@ String lastPattern = "00000";
 volatile bool resetRequested = false;
 
 // command-once flags for motion states
-bool fastCommanded    = false;
-bool slowCommanded    = false;
+bool fastCommanded = false;
+bool slowCommanded = false;
 bool tightenCommanded = false;
+bool recoverTo1200Commanded = false;
 
 // ======================================================
 // =============== SPEED-BASED RAMP (PER FINGER) =========
 // ======================================================
 
-float fullTravelUs = (float)(SERVO_MAX_US - SERVO_MIN_US);   // 1900
+float fullTravelUs = (float)(SERVO_MAX_US - SERVO_MIN_US);
 float autoRampSpeedUsPerSec = fullTravelUs / FULL_SWEEP_TIME_SEC;
 
 int servoPulseUs[NUM_SERVOS] = { SERVO_MAX_US, SERVO_MAX_US, SERVO_MAX_US, SERVO_MAX_US, SERVO_MAX_US };
 
-bool  rampActive[NUM_SERVOS]   = { false, false, false, false, false };
+bool  rampActive[NUM_SERVOS] = { false, false, false, false, false };
 int   rampTargetUs[NUM_SERVOS] = { SERVO_MAX_US, SERVO_MAX_US, SERVO_MAX_US, SERVO_MAX_US, SERVO_MAX_US };
-float rampPosUs[NUM_SERVOS]    = { (float)SERVO_MAX_US, (float)SERVO_MAX_US, (float)SERVO_MAX_US, (float)SERVO_MAX_US, (float)SERVO_MAX_US };
+float rampPosUs[NUM_SERVOS] = { (float)SERVO_MAX_US, (float)SERVO_MAX_US, (float)SERVO_MAX_US, (float)SERVO_MAX_US, (float)SERVO_MAX_US };
 
-float rampSpeedUsPerSec_f[NUM_SERVOS] = {0, 0, 0, 0, 0};
+float rampSpeedUsPerSec_f[NUM_SERVOS] = { 0, 0, 0, 0, 0 };
 unsigned long lastRampUpdateMs = 0;
 
 // ======================================================
@@ -145,7 +148,6 @@ float fsrSlope[NUM_SENSORS] = {0};
 // ====================== THRESHOLDS =====================
 // ======================================================
 
-// huge FSR change only in CLOSING_SLOW
 // Per-sensor max range (based on your info)
 const float fsrMaxRange[NUM_SENSORS] = {
   300, // PB0
@@ -160,31 +162,33 @@ const float fsrMaxRange[NUM_SENSORS] = {
 };
 
 // Huge change threshold as a fraction of that sensor’s range
-const float FSR_SLOW_HUGE_DELTA_FRAC = 0.30f;  // start with 0.25~0.35
-
+const float FSR_SLOW_HUGE_DELTA_FRAC = 0.30f;
 float fsrSlowBase[NUM_SENSORS] = {0};
 
-// current high after closing slow => tighten
+// current high => hold
 const float I_TIGHTEN_HIGH_MA = 800.0f;
 
-// ======================================================
-// ================= HOLD RELEASE RULE ===================
-// ======================================================
-
-// If we're in HOLD, and contact disappears:
-// - FSR drops below 20% of range
-// - Current drops below 100 mA
-// then go to TIGHTEN again.
+// HOLD release rule (contact disappears)
 const float HOLD_RELEASE_FSR_FRAC = 0.20f;
 const float HOLD_RELEASE_I_MA     = 100.0f;
-
-// Debounce: must stay low for this long to avoid noise flipping states
 const uint32_t HOLD_RELEASE_DEBOUNCE_MS = 150;
 uint32_t holdReleaseLowStartMs = 0;
 
 // ======================================================
+// ================== SETTLE -> RECOVER =================
+// ======================================================
+
+const float SETTLE_RECOVER_HIGH_FRAC = 0.30f;     // had contact if ANY sensor > 30% range
+const float SETTLE_RECOVER_LOW_ABS   = 30.0f;     // dropped if ALL sensors < 30 absolute
+const uint32_t SETTLE_RECOVER_DEBOUNCE_MS = 120;
+
+bool settleHadStrongContact = false;
+uint32_t settleRecoverStartMs = 0;
+
+// ======================================================
 // =================== SERVO ATTACH ======================
 // ======================================================
+
 void attachServosOnce() {
   if (servosEnabled) return;
 
@@ -201,6 +205,7 @@ void attachServosOnce() {
 // ======================================================
 // ================== PCA9548A SELECT ====================
 // ======================================================
+
 void selectPCAChannel(uint8_t channel) {
   Wire.beginTransmission(PCA9548A_ADDRESS);
   Wire.write(1 << channel);
@@ -256,8 +261,7 @@ void applyServoPulses() {
     if (pw < SERVO_MIN_US) pw = SERVO_MIN_US;
     if (pw > SERVO_MAX_US) pw = SERVO_MAX_US;
 
-    // disabled finger always open/spread
-    if (!fingerEnabled[f]) pw = SERVO_MAX_US;
+    if (!fingerEnabled[f]) pw = SERVO_MAX_US;  // disabled finger always open/spread
     servoPulseUs[f] = pw;
   }
 
@@ -273,8 +277,9 @@ void applyServoPulses() {
 }
 
 // ======================================================
-// =============== START/UPDATE PER-FINGER RAMP ===========
+// =============== START/UPDATE PER-FINGER RAMP ==========
 // ======================================================
+
 void startRampAllToUsingGlobalMul(int targetUs, float baseSpeedUsPerSec, bool onlyEnabled) {
   attachServosOnce();
 
@@ -297,7 +302,6 @@ void startRampAllToUsingGlobalMul(int targetUs, float baseSpeedUsPerSec, bool on
 
   lastRampUpdateMs = millis();
 }
-
 
 bool anyRampActive() {
   for (int f = 0; f < NUM_SERVOS; f++) if (rampActive[f]) return true;
@@ -348,6 +352,7 @@ void updateRamp() {
 // ======================================================
 // ================= SENSOR UPDATE (FSM) =================
 // ======================================================
+
 static inline float lpFilter(float prev, float x, float alpha) {
   return prev + alpha * (x - prev);
 }
@@ -370,8 +375,9 @@ void updateSensorsFSM(float dtSec) {
 }
 
 // ======================================================
-// ================= EVENT DETECTION (NEW) ===============
+// ================= EVENT DETECTION =====================
 // ======================================================
+
 bool hugeFsrChangeDuringSlow() {
   for (int s = 0; s < NUM_SENSORS; s++) {
     float delta = fabsf(fsrFilt[s] - fsrSlowBase[s]);
@@ -413,9 +419,24 @@ bool enabledReachedTargetUs(int targetUs, int tolUs = 5) {
   return true;
 }
 
+bool anyFsrAboveFrac(float frac) {
+  for (int s = 0; s < NUM_SENSORS; s++) {
+    if ((fsrFilt[s] / fsrMaxRange[s]) > frac) return true;
+  }
+  return false;
+}
+
+bool allFsrBelowAbs(float absTh) {
+  for (int s = 0; s < NUM_SENSORS; s++) {
+    if (fsrFilt[s] >= absTh) return false;
+  }
+  return true;
+}
+
 // ======================================================
 // ================= FSM UTILITIES =======================
 // ======================================================
+
 const char* stateName(HandState s) {
   switch (s) {
     case STATE_IDLE:         return "IDLE";
@@ -424,6 +445,7 @@ const char* stateName(HandState s) {
     case STATE_TIGHTEN:      return "TIGHTEN";
     case STATE_HOLD:         return "HOLD";
     case STATE_SETTLE:       return "SETTLE";
+    case STATE_RECOVER:      return "RECOVER";
     case STATE_RESETTING:    return "RESETTING";
     default:                 return "UNKNOWN";
   }
@@ -437,44 +459,45 @@ void enterState(HandState s) {
   }
 
   // reset command flags on every state entry
-  fastCommanded    = false;
-  slowCommanded    = false;
+  fastCommanded = false;
+  slowCommanded = false;
   tightenCommanded = false;
+  recoverTo1200Commanded = false;
 
   // snapshot baseline for slow-phase FSR rule
   if (s == STATE_CLOSING_SLOW) {
     for (int i = 0; i < NUM_SENSORS; i++) fsrSlowBase[i] = fsrFilt[i];
   }
 
-  // print immediately on transition
+  // Clear settle-drop tracking when leaving settle
+  if (s != STATE_SETTLE) {
+    settleHadStrongContact = false;
+    settleRecoverStartMs = 0;
+  }
+
   Serial.print("[STATE] ");
   Serial.println(stateName(state));
-
-  // keep consistency with printStateIfChanged()
   lastPrintedState = state;
 }
 
 // ======================================================
 // ====================== RESET (RAMP OPEN) ==============
 // ======================================================
+
 void startResettingNow() {
   resetRequested = false;
 
   attachServosOnce();
   stopAllRamps();
 
-  // Clear pattern so user can send a new one after reset completes
   hasPattern = false;
   lastPattern = "00000";
 
-  // Open all fingers (ignore last enabled selection during reset)
   for (int f = 0; f < NUM_SERVOS; f++) fingerEnabled[f] = true;
 
   enterState(STATE_RESETTING);
 
-  // Ramp open at NORMAL speed
-  // Reset: usually keep all at 1.0 (same speed)
-  speedMul[0]=1.0f; speedMul[1]=1.0f; speedMul[2]=1.0f; speedMul[3]=1.0f; speedMul[4]=1.0f;
+  speedMul[0] = 1.0f; speedMul[1] = 1.0f; speedMul[2] = 1.0f; speedMul[3] = 1.0f; speedMul[4] = 1.0f;
   startRampAllToUsingGlobalMul(SERVO_MAX_US, autoRampSpeedUsPerSec, false);
 
   Serial.println("[UI] RESET: Opening/spreading at normal speed...");
@@ -483,9 +506,9 @@ void startResettingNow() {
 // ======================================================
 // ====================== GRASP START ====================
 // ======================================================
+
 void startGraspNow() {
   attachServosOnce();
-
   enterState(STATE_CLOSING_FAST);
 
   Serial.print("[UI] START grasp with pattern ");
@@ -495,6 +518,7 @@ void startGraspNow() {
 // ======================================================
 // ====================== PATTERN PARSE ==================
 // ======================================================
+
 bool parseShapePattern(const String& pat) {
   if (pat.length() != 5) return false;
   for (int i = 0; i < 5; i++) {
@@ -514,6 +538,7 @@ bool isPattern5(const String& s) {
 // ======================================================
 // ========================== SETUP ======================
 // ======================================================
+
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -544,10 +569,8 @@ void setup() {
   if (!inaPresentOnCurrentBus()) { Serial.println("INA226 NOT FOUND on PCA channel 4. Halting."); while (1) {} }
   if (!ina226_4.init())          { Serial.println("INA226 init FAILED on PCA channel 4. Halting."); while (1) {} }
 
-  // FSR pins
   for (int i = 0; i < NUM_SENSORS; i++) pinMode(fsrPins[i], INPUT_ANALOG);
 
-  // Start opened/spread
   attachServosOnce();
   for (int f = 0; f < NUM_SERVOS; f++) {
     fingerEnabled[f] = true;
@@ -571,6 +594,7 @@ void setup() {
 // ======================================================
 // ================== SERIAL COMMAND PARSER ==============
 // ======================================================
+
 String cmdLine;
 
 void handleCommandLine(const String& cmdIn) {
@@ -588,18 +612,24 @@ void handleCommandLine(const String& cmdIn) {
   }
 
   if (isPattern5(cmd)) {
+    // ✅ Only allow patterns when IDLE (boot/after reset)
+    if (state != STATE_IDLE) {
+      Serial.println("[UI] BUSY: Hand is not IDLE. Press '3' to reset before sending a new pattern.");
+      return;
+    }
+
     if (!parseShapePattern(cmd)) {
       Serial.println("[UI] ERROR: Invalid pattern.");
       return;
     }
+
     hasPattern = true;
     lastPattern = cmd;
 
     Serial.print("[UI] Pattern stored: ");
     Serial.println(cmd);
 
-    if (state == STATE_IDLE) Serial.println("[UI] Ready. Send '2' to start grasp.");
-    else Serial.println("[UI] Pattern stored (hand busy). Press '3' to reset if you want to restart.");
+    Serial.println("[UI] Ready. Send '2' to start grasp.");
     return;
   }
 
@@ -622,6 +652,7 @@ void handleCommandLine(const String& cmdIn) {
 // ======================================================
 // =========================== LOOP ======================
 // ======================================================
+
 void loop() {
   // Serial line input
   while (Serial.available()) {
@@ -637,7 +668,7 @@ void loop() {
     }
   }
 
-  // Reset works anywhere (but now ramps open at normal speed)
+  // Reset works anywhere
   if (resetRequested) {
     startResettingNow();
   }
@@ -662,16 +693,12 @@ void loop() {
         break;
 
       case STATE_RESETTING: {
-        // When opening ramp completes -> IDLE
         if (!anyRampActive()) {
-
           stopAllRamps();
 
-          // Force exact open position (eliminates rounding/tolerance issues)
           for (int f = 0; f < NUM_SERVOS; f++) {
             servoPulseUs[f] = SERVO_MAX_US;
           }
-
           applyServoPulses();
 
           enterState(STATE_IDLE);
@@ -681,20 +708,17 @@ void loop() {
       }
 
       case STATE_CLOSING_FAST: {
-        // Move to 2000 @ normal speed (only once)
         if (!fastCommanded) {
-          // FAST multipliers
-          speedMul[0] = 1.00f; // Pinky
-          speedMul[1] = 4.00f; // Ring
-          speedMul[2] = 1.00f; // Middle 
-          speedMul[3] = 1.00f; // Index
-          speedMul[4] = 1.00f; // Thumb
+          speedMul[0] = 1.00f;
+          speedMul[1] = 4.00f;
+          speedMul[2] = 1.00f;
+          speedMul[3] = 1.00f;
+          speedMul[4] = 1.00f;
 
           startRampAllToUsingGlobalMul(FAST_TARGET_US, autoRampSpeedUsPerSec, true);
           fastCommanded = true;
         }
 
-        // When enabled fingers finish reaching 2000 -> go to slow phase
         if (!anyEnabledRampActive() && enabledReachedTargetUs(FAST_TARGET_US, 8)) {
           enterState(STATE_CLOSING_SLOW);
         }
@@ -702,82 +726,75 @@ void loop() {
       }
 
       case STATE_CLOSING_SLOW: {
-        // Move 2000 -> 1400 @ half speed (only once)
         if (!slowCommanded) {
-          // SLOW multipliers 
-          speedMul[0] = 1.00f; // Pinky
-          speedMul[1] = 8.00f; // Ring
-          speedMul[2] = 1.00f; // Middle 
-          speedMul[3] = 1.00f; // Index
-          speedMul[4] = 1.00f; // Thumb
+          speedMul[0] = 1.00f;
+          speedMul[1] = 8.00f;
+          speedMul[2] = 1.00f;
+          speedMul[3] = 1.00f;
+          speedMul[4] = 1.00f;
 
           startRampAllToUsingGlobalMul(SLOW_TARGET_US, autoRampSpeedUsPerSec * 0.50f, true);
           slowCommanded = true;
         }
 
-        // If huge FSR change happens during slow -> HOLD
         if (hugeFsrChangeDuringSlow()) {
           enterState(STATE_HOLD);
           Serial.println("[FSM] Huge FSR change detected in CLOSING_SLOW -> HOLD");
-          stopAllRamps(); 
-          break;
-        }
-        // If current goes high DURING slow ramp -> HOLD immediately
-        if (anyEnabledRampActive() && currentHighSuggestHold()) {                // stop slow motion
-          enterState(STATE_HOLD);     
-          Serial.println("[FSM] Current high during CLOSING_SLOW -> HOLD");
-          stopAllRamps(); 
+          stopAllRamps();
           break;
         }
 
-        // When slow ramp finishes:
+        if (anyEnabledRampActive() && currentHighSuggestHold()) {
+          enterState(STATE_HOLD);
+          Serial.println("[FSM] Current high during CLOSING_SLOW -> HOLD");
+          stopAllRamps();
+          break;
+        }
+
         if (!anyEnabledRampActive() && enabledReachedTargetUs(SLOW_TARGET_US, 8)) {
-            enterState(STATE_TIGHTEN);
-            Serial.println("[FSM] CLOSING_SLOW complete -> TIGHTEN");
-          }
+          enterState(STATE_TIGHTEN);
+          Serial.println("[FSM] CLOSING_SLOW complete -> TIGHTEN");
         }
         break;
+      }
 
       case STATE_TIGHTEN: {
-        // Tighten = ramp enabled fingers toward 500 @ 30% speed (only once)
         if (!tightenCommanded) {
           speedMul[0] = 1.00f;
           speedMul[1] = 8.00f;
-          speedMul[2] = 1.00f; 
+          speedMul[2] = 1.00f;
           speedMul[3] = 1.00f;
           speedMul[4] = 1.00f;
 
           startRampAllToUsingGlobalMul(SERVO_MIN_US, autoRampSpeedUsPerSec * 0.30f, true);
           tightenCommanded = true;
-          Serial.println("[FSM] TIGHTEN started: ramp -> 800us @ 30% speed");
+          Serial.println("[FSM] TIGHTEN started: ramp -> 700us @ 30% speed");
         }
 
-        // If huge FSR change happens during slow -> HOLD
         if (hugeFsrChangeDuringSlow()) {
           enterState(STATE_HOLD);
           Serial.println("[FSM] Huge FSR change detected in TIGHTEN -> HOLD");
-          stopAllRamps(); 
-          break;
-        }
-        // If current goes high DURING slow ramp -> HOLD immediately
-        if (anyEnabledRampActive() && currentHighSuggestHold()) {                // stop slow motion
-          enterState(STATE_HOLD);     
-          Serial.println("[FSM] Current high during TIGHTEN -> HOLD");
-          stopAllRamps(); 
+          stopAllRamps();
           break;
         }
 
-        // If enabled fingers reached 500 -> SETTLE
+        if (anyEnabledRampActive() && currentHighSuggestHold()) {
+          enterState(STATE_HOLD);
+          Serial.println("[FSM] Current high during TIGHTEN -> HOLD");
+          stopAllRamps();
+          break;
+        }
+
         if (!anyEnabledRampActive() && enabledReachedTargetUs(SERVO_MIN_US, 8)) {
           stopAllRamps();
           enterState(STATE_SETTLE);
-          Serial.println("[FSM] Reached 500us -> SETTLE (no movement)");
+          Serial.println("[FSM] Reached 700us -> SETTLE (no movement)");
         }
         break;
       }
 
       case STATE_HOLD: {
-        stopAllRamps(); // maintain grasp
+        stopAllRamps();
 
         bool fsrLow = fsrLowEnoughForRelease();
         bool iLow   = currentLowEnoughForRelease();
@@ -789,19 +806,63 @@ void loop() {
 
           if (millis() - holdReleaseLowStartMs >= HOLD_RELEASE_DEBOUNCE_MS) {
             enterState(STATE_TIGHTEN);
-            Serial.println("[FSM] HOLD: contact low (FSR<10% + I<100mA) -> TIGHTEN");
-            // tightenCommanded will reset because enterState() resets flags
+            Serial.println("[FSM] HOLD: contact low (FSR<20% + I<100mA) -> TIGHTEN");
           }
         } else {
-          holdReleaseLowStartMs = 0; // not consistently low -> stay HOLD
+          holdReleaseLowStartMs = 0;
+        }
+        break;
+      }
+
+      case STATE_SETTLE: {
+        stopAllRamps();
+
+        // 1) if we ever had solid contact in settle
+        if (anyFsrAboveFrac(SETTLE_RECOVER_HIGH_FRAC)) {
+          settleHadStrongContact = true;
+          settleRecoverStartMs = 0;
+        }
+
+        // 2) if we had contact before, and now all sensors < 30 -> RECOVER (debounced)
+        if (settleHadStrongContact && allFsrBelowAbs(SETTLE_RECOVER_LOW_ABS)) {
+          if (settleRecoverStartMs == 0) {
+            settleRecoverStartMs = millis();
+          }
+
+          if (millis() - settleRecoverStartMs >= SETTLE_RECOVER_DEBOUNCE_MS) {
+            enterState(STATE_RECOVER);
+            Serial.println("[FSM] SETTLE: contact dropped (was >30% range, now <30) -> RECOVER");
+          }
+        } else {
+          settleRecoverStartMs = 0;
         }
 
         break;
       }
 
-      case STATE_SETTLE:
-        stopAllRamps();
+      case STATE_RECOVER: {
+        // In SETTLE we are already at SERVO_MIN_US (700).
+        // RECOVER: spread to 1200, then retry TIGHTEN.
+
+        if (!recoverTo1200Commanded) {
+          speedMul[0] = 1.00f;
+          speedMul[1] = 8.00f;
+          speedMul[2] = 1.00f;
+          speedMul[3] = 1.00f;
+          speedMul[4] = 1.00f;
+
+          startRampAllToUsingGlobalMul(RECOVER_SPREAD_US, autoRampSpeedUsPerSec * 0.30f, true);
+          recoverTo1200Commanded = true;
+          Serial.println("[FSM] RECOVER: spread -> 1200us");
+          break;
+        }
+
+        if (!anyEnabledRampActive() && enabledReachedTargetUs(RECOVER_SPREAD_US, 8)) {
+          enterState(STATE_TIGHTEN);
+          Serial.println("[FSM] RECOVER complete -> TIGHTEN");
+        }
         break;
+      }
     }
   }
 
